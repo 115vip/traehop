@@ -72,6 +72,26 @@ async function readFromStorage() {
   };
 }
 
+// 设备凭证键：iCubeAuthInfo://icube-dc:<deviceId>
+// 键名里的 <deviceId> 就是签到接口上报的 x-device-id（只读，用于让用户自行核对跨账号是否同设备）
+const DC_KEY_PREFIX = 'iCubeAuthInfo://icube-dc:';
+
+function readDeviceId() {
+  try {
+    const storagePath = getStoragePath();
+    if (!fs.existsSync(storagePath)) return null;
+    const data = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+    for (const key of Object.keys(data)) {
+      if (key.startsWith(DC_KEY_PREFIX) && key.length > DC_KEY_PREFIX.length) {
+        return key.slice(DC_KEY_PREFIX.length);
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function readTokenFromLogs() {
   const config = getPlatformConfig();
   const logsDir = path.join(config.appSupportBase, 'logs');
@@ -111,4 +131,4 @@ async function readCurrentTraeToken() {
   }
 }
 
-module.exports = { readCurrentTraeToken, readFromStorage, getStoragePath };
+module.exports = { readCurrentTraeToken, readFromStorage, getStoragePath, readDeviceId };

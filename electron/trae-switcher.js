@@ -1,10 +1,18 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync, spawn } = require('child_process');
+const { exec, spawn } = require('child_process');
+const { promisify } = require('util');
 const { getPlatformConfig } = require('./platform-config');
 const { getTraePath } = require('./account-store');
 const { encryptString } = require('./trae-byte-crypto');
+
+const execAsync = promisify(exec);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 切换串行化：killTrae 异步化后若允许重入，两次切换会交叉写 machineid / storage.json，
+// 得到的结果账号不可预期。这里用一把锁把「卡死」换成「明确拒绝」。
+let switching = false;
 
 const AUTH_PROVIDER_ID = 'icube.cloudide';
 const AUTH_KEY = `iCubeAuthInfo://${AUTH_PROVIDER_ID}`;
@@ -28,10 +36,13 @@ function getTraeDataPath() {
   return config.appSupportBase;
 }
 
-function isTraeRunning() {
+// 原为 execSync 同步实现：tasklist/taskkill 单次 200~400ms，killTrae 内共调用 4 次，
+// 叠加 timeout /t 1 后主进程事件循环被冻结约 2 秒，切换期间窗口完全无响应。
+// 改为异步后事件循环可继续响应；唯一外部调用方 switch-check.checkBeforeSwitch 已是 async，同步改为 await 即可。
+async function isTraeRunning() {
   if (process.platform === 'darwin') {
     try {
-      execSync('pgrep -f "Trae.app/Contents/MacOS"', { stdio: 'ignore' });
+      await execAsync('pgrep -f "Trae.app/Contents/MacOS"', { stdio: 'ignore' });
       return true;
     } catch {
       return false;
@@ -39,8 +50,12 @@ function isTraeRunning() {
   }
   if (process.platform === 'win32') {
     try {
-      const out = execSync('tasklist /FI "IMAGENAME eq Trae.exe" /NH', { encoding: 'utf8' });
-      return out.includes('Trae.exe');
+      const { stdout } = await execAsync('tasklist /FI "IMAGENAME eq Trae CN.exe" /NH', {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 5000,
+      });
+      return String(stdout || '').includes('Trae CN.exe');
     } catch {
       return false;
     }
@@ -48,40 +63,41 @@ function isTraeRunning() {
   return false;
 }
 
-function killTrae() {
-  if (!isTraeRunning()) return;
+async function killTrae() {
+  if (!(await isTraeRunning())) return;
 
   if (process.platform === 'darwin') {
     try {
-      execSync('osascript -e \'tell application "Trae" to quit\'', { stdio: 'ignore' });
+      await execAsync('osascript -e \'tell application "Trae" to quit\'', { stdio: 'ignore' });
     } catch {
       /* ignore */
     }
-    execSync('sleep 1.5');
-    if (isTraeRunning()) {
+    await sleep(1500);
+    if (await isTraeRunning()) {
       try {
-        execSync('pkill -9 -f "Trae.app/Contents/MacOS"', { stdio: 'ignore' });
+        await execAsync('pkill -9 -f "Trae.app/Contents/MacOS"', { stdio: 'ignore' });
       } catch {
         /* ignore */
       }
     }
   } else if (process.platform === 'win32') {
     try {
-      execSync('taskkill /IM Trae.exe', { stdio: 'ignore' });
+      await execAsync('taskkill /IM Trae CN.exe', { stdio: 'ignore', windowsHide: true });
     } catch {
       /* ignore */
     }
-    try {
-      execSync('timeout /t 1 /nobreak', { stdio: 'ignore' });
-    } catch {
-      /* ignore */
-    }
-    if (isTraeRunning()) {
-      execSync('taskkill /F /IM Trae.exe', { stdio: 'ignore' });
+    // 原为 execSync('timeout /t 1 /nobreak')：固定阻塞 1 秒且同步。改为不阻塞事件循环的等待。
+    await sleep(1000);
+    if (await isTraeRunning()) {
+      try {
+        await execAsync('taskkill /F /IM Trae CN.exe', { stdio: 'ignore', windowsHide: true });
+      } catch {
+        /* ignore */
+      }
     }
   }
 
-  if (isTraeRunning()) {
+  if (await isTraeRunning()) {
     throw new Error('无法关闭 Trae IDE，请手动关闭后重试');
   }
 }
@@ -96,7 +112,7 @@ function buildUserInfo(account) {
   const now = new Date();
   const expiredAt = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
   const refreshExpiredAt = new Date(now.getTime() + 180 * 24 * 60 * 60 * 1000);
-  const region = (account.region || 'SG').toUpperCase();
+  const region = (account.region || 'CN').toUpperCase();
   const host =
     region === 'CN'
       ? 'https://api.trae.com.cn'
@@ -228,9 +244,62 @@ function clearLoginCache(traePath) {
 }
 
 async function switchTraeAccount(account) {
-  killTrae();
+  if (switching) throw new Error('切换正在进行中，请等待当前切换完成后再试');
+  switching = true;
+  try {
+    return await doSwitchTraeAccount(account);
+  } finally {
+    switching = false;
+  }
+}
+
+// 切换是「先写 machineid，再写 storage.json」的多步写操作。任何一步抛错都会留下
+// machineid 已换、登录信息没换（或反之）的半切换状态，Trae 再启动时登录态就错乱了。
+// 这里在动手之前快照两份文件，失败时整体回滚。
+function snapshotTraeState(traePath) {
+  const machineIdPath = path.join(traePath, 'machineid');
+  const storagePath = path.join(traePath, 'User', 'globalStorage', 'storage.json');
+  return {
+    machineIdPath,
+    storagePath,
+    machineId: fs.existsSync(machineIdPath) ? fs.readFileSync(machineIdPath) : null,
+    storage: fs.existsSync(storagePath) ? fs.readFileSync(storagePath) : null,
+  };
+}
+
+function restoreTraeState(snapshot) {
+  const restoreFile = (target, content) => {
+    if (content === null) {
+      removeIfExists(target);
+      return;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
+  };
+
+  try {
+    restoreFile(snapshot.machineIdPath, snapshot.machineId);
+    restoreFile(snapshot.storagePath, snapshot.storage);
+  } catch (err) {
+    // 回滚失败要大声说出来：此时磁盘上是半切换状态，用户需要知道手动检查
+    console.warn('回滚 Trae 配置失败，请手动检查 machineid 与 storage.json:', err.message);
+  }
+}
+
+async function doSwitchTraeAccount(account) {
+  await killTrae();
 
   const traePath = getTraeDataPath();
+  const snapshot = snapshotTraeState(traePath);
+  try {
+    return await applyTraeSwitch(traePath, account);
+  } catch (err) {
+    restoreTraeState(snapshot);
+    throw new Error(`切换失败，已回滚 Trae 配置：${err.message}`);
+  }
+}
+
+async function applyTraeSwitch(traePath, account) {
   const machineId = account.machineId || generateMachineId();
 
   fs.writeFileSync(path.join(traePath, 'machineid'), machineId, 'utf8');
@@ -258,7 +327,9 @@ async function switchTraeAccount(account) {
   fs.writeFileSync(storagePath, JSON.stringify(json, null, 2), 'utf8');
   await writeTraeLoginInfo(traePath, account);
 
-  execSync('sleep 0.5');
+  // 原版为 execSync('sleep 0.5')：Windows cmd 无 sleep 命令，会抛错并中断后续 openTrae()，
+  // 导致"切换实际成功却弹红色报错"。改为跨平台的无阻塞等待。
+  await new Promise((resolve) => setTimeout(resolve, 500));
 
   try {
     openTrae();
@@ -284,8 +355,10 @@ function scanTraePath() {
     throw new Error('未找到 Trae.app，请手动选择');
   }
 
-  if (process.platform === 'win32' && fs.existsSync(config.defaultTraeApp)) {
-    return config.defaultTraeApp;
+  if (process.platform === 'win32') {
+    for (const p of config.traeAppCandidates || [config.defaultTraeApp]) {
+      if (fs.existsSync(p)) return p;
+    }
   }
 
   throw new Error('请手动设置 Trae IDE 路径');
@@ -296,5 +369,6 @@ module.exports = {
   scanTraePath,
   getTraeDataPath,
   isTraeRunning,
+  openTrae,
   AUTH_KEY,
 };

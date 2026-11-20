@@ -27,15 +27,16 @@ async function checkBeforeSwitch(id) {
         await accountStore.refreshAccountToken(id);
         account = accountStore.getAccount(id);
         warnings.push('Token 已提前刷新');
-      } catch {
-        warnings.push('Token 即将过期，自动刷新失败');
+      } catch (err) {
+        // 原为 catch {}：吞掉异常后只剩一句固定文案，无法判断是 cookie 失效还是网络问题
+        warnings.push(`Token 即将过期，自动刷新失败：${err.message}`);
       }
     } else {
       warnings.push('Token 即将过期，建议续登');
     }
   }
 
-  if (isTraeRunning()) {
+  if (await isTraeRunning()) {
     warnings.push('Trae IDE 正在运行，切换时会自动关闭');
   }
 

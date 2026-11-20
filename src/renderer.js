@@ -1,3 +1,17 @@
+/**
+ * renderer.js 分区索引（1445 行单体，按「自顶向下 = 依赖方向」排列）
+ *   6–53    格式化工具（计数/时间/额度文案）
+ *   54–146  展示层纯函数（toast、unwrap、转义、用量指标 getUsageMetrics）
+ *   147–215 列表筛选 / 排序 / 统计（filterAccounts、sortAccounts、computeStats）
+ *   216–307 加载态与同步态（loadUsageHistory、renderExpiryAlerts、beginAccountsSync）
+ *   308–439 渲染：概览、配额、标签（renderAccountTags、cookieTag、deviceTag）、卡片模板
+ *   440–571 渲染主入口 renderUI + 用量加载（loadAllUsage、refreshAccounts）
+ *   572–621 切换流程（confirmSwitchWarnings、handleSwitch、handleCleanSwitch、switchPage）
+ *   622–697 清理 / 自动刷新 / 主题
+ *   698–886 设置、添加账号、导入导出、详情弹窗
+ *   887–    事件委托与初始化（见文件中部「Events」分隔标记）
+ * 本文件不拆分模块：状态集中在 28–46 行的模块级变量，拆分需跨模块传递，风险高于收益。
+ */
 const api = window.traeAccounts;
 const t = (key, params) => window.TraeHopI18n.t(key, params);
 const localeTag = () => (window.TraeHopI18n.getLocale() === 'zh' ? 'zh-CN' : 'en-US');
@@ -44,6 +58,23 @@ let cleanCleaning = false;
 let cleanScanned = false;
 let lastBackupTs = null;
 let cachedTraePath = null;
+// Trae IDE 运行状态：仅当前账号卡片据此决定显示「打开 IDE」还是「运行中」
+let traeRunning = false;
+let traeRunningChecked = false;
+// 运行中状态下低频轮询探测 IDE 退出：窗口持续聚焦时关掉 Trae 不产生任何事件，
+// 依赖 focus 重查会卡死在「运行中」。仅此状态有轮询开销（单次 tasklist 约 200ms）。
+const TRAE_RUNNING_POLL_MS = 5000;
+let traeRunningPollTimer = null;
+
+function updateTraeRunningPoll() {
+  if (traeRunning && !traeRunningPollTimer) {
+    traeRunningPollTimer = setInterval(() => syncTraeRunning(true), TRAE_RUNNING_POLL_MS);
+  } else if (!traeRunning && traeRunningPollTimer) {
+    clearInterval(traeRunningPollTimer);
+    traeRunningPollTimer = null;
+  }
+}
+let traceLaunching = false;
 let initialLoading = true;
 let accountsSyncing = false;
 let accountsSyncMessage = '';
@@ -116,11 +147,13 @@ function getUsageMetrics(usage) {
   const left = usage?.displayLeft ?? Math.max(0, limit - used);
   const exhausted = !!usage?.exhausted;
   const pct = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  // 国内版积分制存在 credits_limit=-1（无限包），官方语义为剩余无限
+  const fmtNum = (v) => (Number.isFinite(v) ? String(Math.round(v)) : '∞');
   return {
     isDollar, used, limit, left, exhausted, pct,
     usedText: isDollar ? `$${Number(used).toFixed(2)}` : String(Math.round(used)),
-    limitText: isDollar ? `$${Number(limit).toFixed(2)}` : String(Math.round(limit)),
-    leftText: exhausted ? t('overview.exhausted') : isDollar ? `$${left.toFixed(2)}` : String(Math.round(left)),
+    limitText: isDollar ? `$${Number(limit).toFixed(2)}` : fmtNum(limit),
+    leftText: exhausted ? t('overview.exhausted') : isDollar ? `$${left.toFixed(2)}` : fmtNum(left),
     leftNum: left,
   };
 }
@@ -140,6 +173,12 @@ function getQuotaLeftNum(account) {
   const u = usageMap[account.id]?.data;
   if (!u) return -1;
   return getUsageMetrics(u).leftNum;
+}
+
+function getQuotaUsedNum(account) {
+  const u = usageMap[account.id]?.data;
+  if (!u) return -1;
+  return getUsageMetrics(u).used;
 }
 
 function filterAccounts(accounts) {
@@ -170,6 +209,9 @@ function sortAccounts(list) {
       return copy.sort((a, b) => getQuotaLeftNum(b) - getQuotaLeftNum(a));
     case 'quota-asc':
       return copy.sort((a, b) => getQuotaLeftNum(a) - getQuotaLeftNum(b));
+    case 'used-desc':
+      // 与历史列表的「已用」口径对齐：看谁消耗得多，没有用量数据的排最后
+      return copy.sort((a, b) => getQuotaUsedNum(b) - getQuotaUsedNum(a));
     case 'name':
       return copy.sort((a, b) => (a.email || a.name || '').localeCompare(b.email || b.name || ''));
     case 'expiry':
@@ -187,46 +229,160 @@ function getAccountExpirySortKey(account) {
   return (account.tokenExp || 9999999999) * 1000;
 }
 
+/**
+ * 概览统计。口径原则（2026-10-26 重做）：
+ *  1) 账号按「会话状态」与「用量状态」两个维度分开统计，且必须闭合：
+ *     expired + hasQuota + noQuota + unknown === total。
+ *     旧实现把 tokenExpired 也算进 noQuota，导致「用量已满」里混着根本没刷新的过期号，
+ *     且三项百分比加起来不到 100%，用户看不出剩下的账号去哪了。
+ *  2) 积分与美元不能相加。只汇总「主计费类型」（账号数多的那种），另一种单独计数并在单位行标注。
+ *  3) 无限包（displayLimit=Infinity）不能进总额累加，否则总额显示成 Infinity、使用率被算成 0%。
+ */
 function computeStats(accounts) {
-  let hasQuota = 0, noQuota = 0, expired = 0, expiring = 0;
-  let totalUsed = 0, totalLimit = 0, totalLeft = 0, nearestReset = 0, anyDollar = false;
+  let hasQuota = 0, noQuota = 0, expired = 0, expiring = 0, unknown = 0;
+  let nearestReset = 0;
+  let dollarCount = 0, pointCount = 0, unlimitedCount = 0, withData = 0;
+  const sum = { dollar: { used: 0, limit: 0, left: 0 }, point: { used: 0, limit: 0, left: 0 } };
 
   for (const a of accounts) {
-    if (a.tokenExpired) { expired += 1; noQuota += 1; continue; }
+    if (a.tokenExpired) { expired += 1; continue; }
     if (a.tokenExpiringSoon) expiring += 1;
+
     const status = getAccountQuotaStatus(a);
     if (status === 'has-quota') hasQuota += 1;
     else if (status === 'no-quota') noQuota += 1;
+    else unknown += 1;
+
     const u = usageMap[a.id]?.data;
-    if (u) {
-      if (u.isDollarBilling) anyDollar = true;
-      const m = getUsageMetrics(u);
-      totalUsed += m.used; totalLimit += m.limit; totalLeft += m.left;
-      if (u.resetTime && (!nearestReset || u.resetTime < nearestReset)) nearestReset = u.resetTime;
-    }
+    if (!u) continue;
+    withData += 1;
+    if (u.isDollarBilling) dollarCount += 1; else pointCount += 1;
+    const m = getUsageMetrics(u);
+    if (!Number.isFinite(m.limit)) { unlimitedCount += 1; continue; }
+    const bucket = u.isDollarBilling ? sum.dollar : sum.point;
+    bucket.used += m.used; bucket.limit += m.limit; bucket.left += m.left;
+    if (u.resetTime && (!nearestReset || u.resetTime < nearestReset)) nearestReset = u.resetTime;
   }
 
+  // 主口径 = 账号数多的计费类型；平手时取积分（国内版默认）
+  const mainIsDollar = dollarCount > pointCount;
+  const main = mainIsDollar ? sum.dollar : sum.point;
+  const excluded = mainIsDollar ? pointCount : dollarCount;
+  const totalUsed = main.used, totalLimit = main.limit, totalLeft = main.left;
+
   const usedPct = totalLimit > 0 ? Math.min(100, Math.round((totalUsed / totalLimit) * 100)) : 0;
-  const fmt = (v) => (anyDollar ? `$${v.toFixed(2)}` : String(Math.round(v)));
-  return { total: accounts.length, hasQuota, noQuota, expired, expiring, totalUsed, totalLimit, totalLeft, usedPct, nearestReset, anyDollar, fmt };
+  const fmt = (v) => (mainIsDollar ? `$${v.toFixed(2)}` : String(Math.round(v)));
+  return {
+    total: accounts.length, hasQuota, noQuota, expired, expiring, unknown, withData,
+    totalUsed, totalLimit, totalLeft, usedPct, nearestReset,
+    mainIsDollar, unlimitedCount, excludedCount: excluded,
+    // 比率分母用「会话正常的账号数」，避免过期号污染百分比
+    counted: hasQuota + noQuota + unknown,
+    fmt,
+  };
 }
 
 async function loadUsageHistory() {
+  const el = $('#usage-history');
+  const header = document.querySelector('.history-header');
   try {
     const history = await unwrap(api.getUsageHistory());
-    const el = $('#usage-history');
-    const header = document.querySelector('.history-header');
-    if (!history.length) {
-      el.innerHTML = `<p class="muted">${escapeHtml(t('overview.historyEmpty'))}</p>`;
+    const rows = computeUsageDeltas(history);
+    if (!rows.length) {
+      el.innerHTML = `<p class="muted">${escapeHtml(
+        history.length ? t('overview.historyNoDelta') : t('overview.historyEmpty')
+      )}</p>`;
+      el.classList.add('is-empty');
       header?.classList.add('hidden');
       return;
     }
     header?.classList.remove('hidden');
-    el.innerHTML = history.slice(0, 20).map((h) => {
-      const left = h.isDollarBilling ? `$${Number(h.left).toFixed(2)}` : Math.round(h.left);
-      return `<div class="history-row"><span class="history-email">${escapeHtml(h.email || '—')}</span><span class="history-val">${escapeHtml(t('overview.historyLeftVal', { left }))}</span><span class="history-time">${formatTs(h.timestamp)}</span></div>`;
+    el.classList.remove('is-empty');
+    el.innerHTML = rows.slice(0, 20).map((r) => {
+      const { account, delta, used, limit, gapMs, newCycle } = r;
+      const isDollar = !!account.isDollarBilling;
+      const fmt = (v) => (Number.isFinite(v) ? (isDollar ? `$${v.toFixed(2)}` : String(Math.round(v))) : '∞');
+      // 消耗是扣减，用负号而不是正号
+      const deltaText = `${Number.isFinite(delta) ? (isDollar ? `-$${delta.toFixed(2)}` : `-${Math.round(delta)}`) : '∞'}`;
+      const parts = [t('overview.historyDeltaTitle', { delta: deltaText, used: fmt(used), limit: fmt(limit) })];
+      if (newCycle) parts.push(t('overview.historyCycleSuffix'));
+      if (Number.isFinite(gapMs)) parts.push(t('overview.historyGap', { gap: formatGap(gapMs) }));
+      return `<div class="history-row" title="${escapeHtml(parts.join(' · '))}"><span class="history-email">${escapeHtml(
+        account.email || '—'
+      )}</span><span class="history-val">${escapeHtml(deltaText)}</span><span class="history-time">${formatTs(
+        account.timestamp
+      )}</span></div>`;
     }).join('');
   } catch { /* optional */ }
+}
+
+// 旧记录没有 used 字段（只存了 left/limit），兜底还原
+function historyUsedOf(h) {
+  if (Number.isFinite(h.used)) return h.used;
+  const limit = Number.isFinite(h.limit) ? h.limit : Infinity;
+  const left = Number.isFinite(h.left) ? h.left : 0;
+  return Number.isFinite(limit) ? Math.max(0, limit - left) : NaN;
+}
+
+// 历史存的是「每次刷新时的累计用量」，用户要看的是「这一次花了多少」= 相邻两条之差
+function computeUsageDeltas(history) {
+  const byAccount = new Map();
+  for (const h of history) {
+    const key = h.accountId || h.email || '?';
+    if (!byAccount.has(key)) byAccount.set(key, []);
+    byAccount.get(key).push(h);
+  }
+
+  const rows = [];
+  for (const list of byAccount.values()) {
+    list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+    let prev = null;
+    for (const cur of list) {
+      const used = historyUsedOf(cur);
+      if (!Number.isFinite(used)) { prev = cur; continue; }
+
+      let base;
+      let newCycle;
+      if (prev) {
+        base = historyUsedOf(prev);
+        if (!Number.isFinite(base)) { prev = cur; continue; }
+        const cycleChanged = !!(prev.resetTime && cur.resetTime && prev.resetTime !== cur.resetTime);
+        newCycle = used < base || cycleChanged;
+      } else if (Number.isFinite(cur.prevUsed)) {
+        // 首条没有前一条可参照（可能被 store 的 200 条上限挤掉），用写入时留档的基线还原
+        base = cur.prevUsed;
+        newCycle = used < base;
+      } else {
+        prev = cur; continue; // 无基线就不臆造消耗
+      }
+      const prevTs = prev ? prev.timestamp || 0 : 0;
+      prev = cur;
+
+      // 跨计费周期：累计值归零重算，差额会是负数，此时本条 used 就是新周期的消耗量
+      const delta = newCycle ? used : used - base;
+      if (!(delta > 0)) continue; // 0 消耗 = 刷新了但没用，不占列表
+
+      rows.push({
+        account: cur,
+        delta,
+        used,
+        limit: Number.isFinite(cur.limit) ? cur.limit : Infinity,
+        gapMs: prevTs ? (cur.timestamp || 0) - prevTs : NaN,
+        newCycle,
+      });
+    }
+  }
+  return rows.sort((a, b) => (b.account.timestamp || 0) - (a.account.timestamp || 0));
+}
+
+function formatGap(ms) {
+  const mins = Math.round(ms / 60000);
+  if (mins < 1) return '<1m';
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h${mins % 60 ? `${mins % 60}m` : ''}`;
+  return `${Math.floor(hours / 24)}d${hours % 24 ? `${hours % 24}h` : ''}`;
 }
 
 function renderExpiryAlerts() {
@@ -331,33 +487,68 @@ function updateOverview(accounts) {
   content.classList.remove('hidden');
 
   const s = computeStats(accounts);
-  $('#stat-total').textContent = s.total;
-  $('#stat-active').textContent = s.hasQuota;
-  $('#stat-no-quota').textContent = s.noQuota;
-  $('#stat-expired').textContent = s.expired;
-  $('#stat-expiring').textContent = s.expiring;
-  $('#stat-left').textContent = s.fmt(s.totalLeft);
-  $('#stat-used').textContent = s.fmt(s.totalUsed);
-  $('#stat-limit').textContent = s.fmt(s.totalLimit);
-  $('#stat-used-pct').textContent = `${s.usedPct}%`;
-  $('#stat-used-pct-inline').textContent = `${s.usedPct}%`;
-  $('#stat-used-inline').textContent = s.fmt(s.totalUsed);
-  $('#stat-limit-inline').textContent = s.fmt(s.totalLimit);
-  $('#stat-active-ratio').textContent = s.total ? `${Math.round((s.hasQuota / s.total) * 100)}%` : '—';
-  $('#stat-no-quota-ratio').textContent = s.total ? `${Math.round((s.noQuota / s.total) * 100)}%` : '—';
-  $('#stat-limit-unit').textContent = s.anyDollar ? t('overview.dollarUsage') : t('overview.fastRequests');
-  $('#stat-reset').textContent = s.nearestReset ? `${formatResetCountdown(s.nearestReset)} · ${formatDateTime(s.nearestReset)}` : '—';
-  $('#last-refresh-time').textContent = formatRefreshTime(lastRefreshTime);
+  const set = (sel, val) => { const el = $(sel); if (el) el.textContent = val; };
+  const ratio = (n) => (s.counted ? `${Math.round((n / s.counted) * 100)}%` : '—');
+
+  set('#stat-total', s.total);
+  // 账号构成写进 meta，让「有额度 + 已用完 + 未刷新 + 过期 = 总数」能自己核对上
+  const breakdown = [];
+  if (s.noQuota) breakdown.push(`${t('overview.noQuota')} ${s.noQuota}`);
+  if (s.unknown) breakdown.push(`${t('overview.unknown')} ${s.unknown}`);
+  if (s.expired) breakdown.push(`${t('overview.tokenExpired')} ${s.expired}`);
+  const totalMeta = breakdown.length ? breakdown.join(' · ') : t('overview.allHasQuota');
+  set('#stat-total-meta', totalMeta);
+  const totalMetaEl = $('#stat-total-meta');
+  if (totalMetaEl) totalMetaEl.title = totalMeta;
+
+  set('#stat-active', s.hasQuota);
+  set('#stat-active-ratio', ratio(s.hasQuota));
+  set('#stat-no-quota', s.noQuota);
+  set('#stat-no-quota-ratio', ratio(s.noQuota));
+  // 0 值不该借用告警配色：一个号都没用完时红色是误报
+  $('#stat-no-quota')?.closest('.strip-stat')?.classList.toggle('zero', s.noQuota === 0);
+  $('#stat-active')?.closest('.strip-stat')?.classList.toggle('zero', s.hasQuota === 0);
+
+  // 一个账号的用量都没刷出来时，金额位一律显示「—」，而不是显示 0 让人以为额度真的用光了
+  const hasAmount = s.withData > 0;
+  // 同上：剩余合计为 0 只因无限包不计入，此时写 ∞，写 0 会被误读成「额度用光了」
+  set('#stat-left', !hasAmount ? '—' : s.unlimitedCount && s.totalLeft === 0 ? '∞' : s.fmt(s.totalLeft));
+  // 单位行要说明「这个数字是什么、哪些账号没算进来」，否则混合计费/无限包会误读。
+  // 卡片窄：可见部分只留「主单位 + 不限量」，未计入账号走 title，避免出现半截省略号
+  const unitBase = s.mainIsDollar ? t('overview.dollarUsage') : t('overview.fastRequests');
+  let unitShort = unitBase;
+  let unitFull = unitBase;
+  if (s.unlimitedCount) {
+    const u = ` · ${t('overview.unitUnlimited', { n: s.unlimitedCount })}`;
+    unitShort += u; unitFull += u;
+  }
+  if (s.excludedCount) unitFull += ` · ${t('overview.unitExcluded', { n: s.excludedCount })}`;
+  set('#stat-limit-unit', hasAmount ? unitShort : '—');
+  const unitEl = $('#stat-limit-unit');
+  if (unitEl) unitEl.title = hasAmount ? unitFull : '';
+
+  // 会话状态：只报异常会话数，正常时明确写「全部正常」而不是丢一个 0 让人猜
+  const abnormal = s.expired + s.expiring;
+  const sessionParts = [];
+  if (s.expired) sessionParts.push(`${t('overview.tokenExpired')} ${s.expired}`);
+  if (s.expiring) sessionParts.push(`${t('overview.expiringSoon')} ${s.expiring}`);
+  set('#stat-session', abnormal);
+  set('#stat-session-meta', sessionParts.length ? sessionParts.join(' · ') : t('overview.sessionNormal'));
+  const sessionCard = $('#stat-session')?.closest('.strip-stat');
+  if (sessionCard) sessionCard.classList.toggle('alert', abnormal > 0);
+
+  set('#stat-used', hasAmount ? s.fmt(s.totalUsed) : '—');
+  // 无限包不进总额累加，总额因此可能是 0（全是无限包），此时直接写 ∞ 而不是 0
+  set('#stat-limit', !hasAmount ? '—' : s.unlimitedCount && s.totalLimit === 0 ? '∞' : s.fmt(s.totalLimit));
+  set('#stat-used-pct', hasAmount && s.totalLimit > 0 ? `${s.usedPct}%` : '—');
+  set('#stat-reset', s.nearestReset ? `${formatResetCountdown(s.nearestReset)} · ${formatDateTime(s.nearestReset)}` : '—');
+  set('#last-refresh-time', formatRefreshTime(lastRefreshTime));
   renderExpiryAlerts();
 
   const ring = $('#ring-progress');
-  ring.style.strokeDashoffset = RING_CIRCUMFERENCE - (s.usedPct / 100) * RING_CIRCUMFERENCE;
-  ring.style.stroke = s.usedPct >= 90 ? 'var(--red)' : s.usedPct >= 60 ? 'var(--amber)' : 'var(--primary)';
-
-  const stripFill = $('#strip-progress-fill');
-  if (stripFill) {
-    stripFill.style.width = `${s.usedPct}%`;
-    stripFill.style.background = s.usedPct >= 90 ? 'var(--red)' : s.usedPct >= 60 ? 'var(--amber)' : 'var(--primary)';
+  if (ring) {
+    ring.style.strokeDashoffset = RING_CIRCUMFERENCE - (s.usedPct / 100) * RING_CIRCUMFERENCE;
+    ring.style.stroke = s.usedPct >= 90 ? 'var(--red)' : s.usedPct >= 60 ? 'var(--amber)' : 'var(--primary)';
   }
 }
 
@@ -369,7 +560,9 @@ function renderQuotaHtml(u) {
   if (u?.data) {
     const m = getUsageMetrics(u.data);
     const color = m.exhausted || m.pct >= 80 ? 'var(--red)' : m.pct >= 50 ? 'var(--amber)' : 'var(--green)';
-    return `<div class="quota-text"><span><strong>${m.usedText}</strong> / ${m.limitText}</span><span class="quota-left ${m.exhausted ? 'exhausted' : ''}">${m.leftText}</span></div><div class="quota-bar"><div class="quota-bar-fill" style="width:${m.pct}%;background:${color}"></div></div>`;
+    // 右侧那个数字是「剩余」，行内没有位置写两个字，用 title 说明，避免被当成已用量
+    const leftTitle = m.exhausted ? '' : t('accounts.quotaLeftTitle', { n: m.leftText });
+    return `<div class="quota-text"><span><strong>${m.usedText}</strong> / ${m.limitText}</span><span class="quota-left ${m.exhausted ? 'exhausted' : ''}"${leftTitle ? ` title="${escapeHtml(leftTitle)}"` : ''}>${m.leftText}</span></div><div class="quota-bar"><div class="quota-bar-fill" style="width:${m.pct}%;background:${color}"></div></div>`;
   }
   return '<div class="quota-loading">—</div>';
 }
@@ -385,7 +578,46 @@ function renderAccountTags(a) {
     a.tokenExpiringSoon && !a.tokenExpired ? `<span class="tag tag-warn">${escapeHtml(t('accounts.tagExpiring'))}</span>` : '',
     status === 'has-quota' ? `<span class="tag tag-ok">${escapeHtml(t('accounts.tagOk'))}</span>` : '',
     status === 'no-quota' && !a.tokenExpired ? `<span class="tag tag-exhausted">${escapeHtml(t('accounts.tagExhausted'))}</span>` : '',
+    cookieTag(a),
+    deviceTag(a),
   ].filter(Boolean).join('');
+}
+
+// 显示本机设备标识（x-device-id）。它是机器级的，正常情况下每张卡片应显示相同的值；
+// 若切换账号后此处发生变化，说明设备指纹被改写。只读展示，不参与任何切换逻辑。
+function deviceTag(a) {
+  if (!a.deviceId) return '';
+  return `<span class="tag tag-device" title="${escapeHtml(t('accounts.deviceIdTitle'))}">${escapeHtml(
+    t('accounts.tagDevice', { id: a.deviceId })
+  )}</span>`;
+}
+
+// Cookie 是国内版自动续 Token 的唯一凭据，把到期时间显性化，避免静默失效后才发现
+const COOKIE_EXPIRING_SOON_MS = 7 * 24 * 60 * 60 * 1000;
+
+function cookieTag(a) {
+  if (!a.hasCookies || typeof a.cookieExpiredAt !== 'number') return '';
+  const date = new Date(a.cookieExpiredAt);
+  const text = Number.isNaN(date.getTime())
+    ? ''
+    : date.toLocaleDateString(localeTag(), { year: 'numeric', month: 'numeric', day: 'numeric' });
+  if (!text) return '';
+  // Cookie 是国内版自动续 Token 的唯一凭据，到期只能重新浏览器登录。
+  // 已过期 / 7 天内到期的标签做成可点击，直接拉起该账号的续登，省得用户先找按钮再找账号。
+  if (a.cookieExpiredAt <= Date.now()) {
+    return `<span class="tag tag-expired tag-relogin" data-id="${escapeHtml(a.id)}" role="button" title="${escapeHtml(
+      `${t('accounts.cookieExpired')} · ${t('accounts.cookieReloginHint')}`
+    )}">${escapeHtml(t('accounts.cookieExpired'))}</span>`;
+  }
+  const soon = a.cookieExpiredAt - Date.now() < COOKIE_EXPIRING_SOON_MS;
+  const cls = soon ? 'tag-warn' : 'tag-plan';
+  const clickable = soon ? ' tag-relogin' : '';
+  const hint = soon ? ` · ${t('accounts.cookieReloginHint')}` : '';
+  return `<span class="tag ${cls}${clickable}" ${soon ? `data-id="${escapeHtml(a.id)}" role="button"` : ''} title="${escapeHtml(
+    (soon ? t('accounts.cookieExpiring', { date: text }) : t('accounts.cookieValid', { date: text })) + hint
+  )}">${escapeHtml(
+    soon ? t('accounts.cookieExpiring', { date: text }) : t('accounts.cookieValid', { date: text })
+  )}</span>`;
 }
 
 function patchAccountCardUsage(id) {
@@ -395,7 +627,7 @@ function patchAccountCardUsage(id) {
   if (!card) return;
   const u = usageMap[id];
   const quotaEl = card.querySelector('.account-quota');
-  const tagsEl = card.querySelector('.account-tags');
+  const tagsEl = card.querySelector('.account-tags-row');
   if (quotaEl) quotaEl.innerHTML = renderQuotaHtml(u);
   if (tagsEl) tagsEl.innerHTML = renderAccountTags(account);
   const refreshBtn = card.querySelector('.btn-refresh-one');
@@ -417,7 +649,7 @@ function renderAccountCard(a) {
   const checked = selectedIds.has(a.id) ? 'checked' : '';
 
   return `
-    <div class="account-card ${a.isCurrent ? 'current' : ''} ${a.tokenExpired ? 'token-expired' : ''}" data-id="${a.id}">
+    <div class="account-card ${a.isCurrent ? 'current trace-ring' : ''} ${a.tokenExpired ? 'token-expired' : ''}" data-id="${a.id}" data-trace-state="idle">
       <label class="account-check"><input type="checkbox" class="account-select" data-id="${a.id}" ${checked} /></label>
       <div class="avatar">${a.avatarUrl ? `<img src="${escapeHtml(a.avatarUrl)}" alt="" />` : escapeHtml((title || '?').charAt(0).toUpperCase())}</div>
       <div class="account-main">
@@ -426,17 +658,21 @@ function renderAccountCard(a) {
             <div class="account-title">${escapeHtml(title)}</div>
             ${sub ? `<div class="account-sub">${escapeHtml(sub)}</div>` : ''}
           </div>
-          ${tags ? `<div class="account-tags">${tags}</div>` : ''}
         </div>
+        ${tags ? `<div class="account-tags-row">${tags}</div>` : ''}
         <div class="account-quota">${quotaHtml}</div>
       </div>
       <div class="account-actions">
         <button class="btn-icon btn-detail" data-id="${a.id}" title="${escapeHtml(t('common.details'))}">⋯</button>
         <button class="btn-icon btn-refresh-one" data-id="${a.id}" title="${escapeHtml(t('common.refreshUsage'))}">↻</button>
-        ${a.tokenExpired && a.hasCookies ? `<button class="btn btn-ghost btn-action btn-refresh-token" data-id="${a.id}">${escapeHtml(t('common.refresh'))}</button>` : ''}
+        ${a.tokenExpired && a.hasCookies ? `<button class="btn btn-ghost btn-action btn-refresh-token" data-id="${a.id}" title="${escapeHtml(t('accounts.refreshToken'))}">${escapeHtml(t('accounts.refreshToken'))}</button>` : ''}
         ${a.tokenExpired ? `<button class="btn btn-ghost btn-action btn-relogin" data-id="${a.id}">${escapeHtml(t('accounts.relogin'))}</button>` : ''}
         <div class="account-switch-btns">
-          <button class="btn btn-primary btn-action btn-switch-account" data-id="${a.id}" ${a.isCurrent || (a.tokenExpired && !a.hasCookies) ? 'disabled' : ''} title="${escapeHtml(a.isCurrent ? t('accounts.switchTitleCurrent') : t('accounts.switchTitle'))}">${a.isCurrent ? escapeHtml(t('common.current')) : escapeHtml(t('common.switch'))}</button>
+          ${a.isCurrent
+            ? (traeRunning
+              ? `<button class="btn btn-ghost btn-action" data-id="${a.id}" disabled title="${escapeHtml(t('accounts.openIdeRunningTitle'))}">${escapeHtml(t('accounts.ideRunning'))}</button>`
+              : `<button class="btn btn-action btn-trace btn-open-trae" data-id="${a.id}" title="${escapeHtml(t('accounts.openIdeTitle'))}">${escapeHtml(t('accounts.openIde'))}</button>`)
+            : `<button class="btn btn-primary btn-action btn-switch-account" data-id="${a.id}" ${(a.tokenExpired && !a.hasCookies) ? 'disabled' : ''} title="${escapeHtml(t('accounts.switchTitle'))}">${escapeHtml(t('common.switch'))}</button>`}
           <button class="btn btn-ghost btn-action btn-clean-switch" data-id="${a.id}" ${a.isCurrent || (a.tokenExpired && !a.hasCookies) ? 'disabled' : ''} title="${escapeHtml(a.isCurrent ? t('accounts.cleanSwitchTitleCurrent') : t('accounts.cleanSwitchTitle'))}">${escapeHtml(t('accounts.cleanSwitch'))}</button>
         </div>
         <button class="btn-icon btn-danger btn-remove" data-id="${a.id}" title="${escapeHtml(t('common.delete'))}">×</button>
@@ -468,6 +704,41 @@ function renderUI() {
   }
   accountList.innerHTML = filtered.map(renderAccountCard).join('');
   syncSelectAllCheckbox();
+  syncTraeRunning(false);
+}
+
+// 边框光条状态机：state 为 null 即回到初始（无光条）
+function setTraceState(cardEl, state) {
+  if (!cardEl) return;
+  if (state) {
+    cardEl.dataset.traceState = state;
+    cardEl.classList.add('is-tracing');
+  } else {
+    cardEl.dataset.traceState = 'idle';
+    cardEl.classList.remove('is-tracing');
+  }
+}
+
+function clearTraceRing() {
+  document.querySelectorAll('.trace-ring.is-tracing').forEach((el) => setTraceState(el, null));
+}
+
+// 查询 Trae 是否在运行。force=false 时仅首次查询，避免每次 renderUI 都跑一次 tasklist。
+async function syncTraeRunning(force) {
+  if (traeRunningChecked && !force) return;
+  try {
+    const running = await unwrap(api.isTraeRunning());
+    traeRunningChecked = true;
+    const v = !!running;
+    if (v !== traeRunning) {
+      traeRunning = v;
+      renderUI();
+    }
+    updateTraeRunningPoll();
+  } catch {
+    // 探测失败时保持原值不动：轮询期间 tasklist 偶发失败若按「未运行」处理，
+    // 会让「运行中」闪回「打开 IDE」，诱导重复拉起 IDE。无基线时下次 renderUI 再试。
+  }
 }
 
 function syncSelectAllCheckbox() {
@@ -498,9 +769,16 @@ async function refreshOneAccountUsage(id) {
 async function loadAllUsage(silent = false) {
   if (!allAccounts.length) return;
   if (!silent) { for (const a of allAccounts) usageMap[a.id] = { loading: true }; renderUI(); }
-  await Promise.allSettled(allAccounts.map((a) => loadUsageForAccount(a.id)));
+  // 每账号完成即 patch 自己的卡片，不再收尾整表重绘：
+  // 实测 100 账号全表 innerHTML 重建 19ms（超一帧），逐卡 patch 只改 quota/tags 两个小节点。
+  // 约束：本函数不修改 tokenExpired / isCurrent / traeRunning，因此无需重建按钮区；
+  //       若将来在此更新账号结构字段，必须改回 renderUI()。
+  await Promise.allSettled(allAccounts.map(async (a) => {
+    await loadUsageForAccount(a.id);
+    patchAccountCardUsage(a.id);
+  }));
   lastRefreshTime = new Date();
-  renderUI();
+  updateOverview(allAccounts);
   updateAutoRefreshStatus();
   await loadUsageHistory();
 }
@@ -553,7 +831,44 @@ async function handleSwitch(id, skipCheck = false) {
   const result = await unwrap(api.switchAccount(id, skipCheck));
   showToast(t('toast.switched', { email: result.email || t('common.account') }));
   await refreshAccounts();
+  // 切换内部会 killTrae() 后重新 openTrae()，IDE 运行状态已变，须强制重查：
+  // 否则切换前未运行时 traeRunning=false、退出探测轮询不启动，IDE 已被拉起
+  // 却永远显示「打开 IDE」，用户再点会重复拉起（renderer.js updateTraeRunningPoll）。
+  await syncTraeRunning(true);
   return result;
+}
+
+// 多账号时最常用的动作就是「切到还剩最多额度的那个」。数据已经在 usageMap 里，
+// 没必要让用户自己逐个看进度条再挑；无限包（-1）按官方语义视为剩余最多。
+function pickBestAccount() {
+  let best = null;
+  let bestLeft = -Infinity;
+  for (const a of allAccounts) {
+    if (a.tokenExpired) continue;
+    const u = usageMap[a.id];
+    if (!u?.data) continue;
+    const m = getUsageMetrics(u.data);
+    if (m.exhausted) continue;
+    const left = Number.isFinite(m.leftNum) ? m.leftNum : Infinity;
+    if (left > bestLeft) {
+      bestLeft = left;
+      best = a;
+    }
+  }
+  return best;
+}
+
+async function handleSwitchBest() {
+  const best = pickBestAccount();
+  if (!best) {
+    showToast(t('overview.switchBestNone'), true);
+    return;
+  }
+  if (best.isCurrent) {
+    showToast(t('overview.switchBestAlready', { name: best.name || best.email || t('common.account') }));
+    return;
+  }
+  await handleSwitch(best.id);
 }
 
 async function handleCleanSwitch(id) {
@@ -574,6 +889,8 @@ async function handleCleanSwitch(id) {
   const result = await unwrap(api.cleanAndSwitch(id));
   showToast(t('toast.cleanSwitched', { email: result.email || t('common.account') }));
   await refreshAccounts();
+  // 同 handleSwitch：cleanAndSwitch 内部同样杀掉并重启 IDE，须强制重查运行状态
+  await syncTraeRunning(true);
 }
 
 function switchPage(page) {
@@ -680,6 +997,25 @@ function toggleTheme() {
   saveSettings({ theme: next });
 }
 
+/**
+ * 开关与子项联动：功能关掉时，它下面的间隔/阈值不该还能改。
+ * 之前「低用量提醒」关着也能调「剩余低于 5%」，用户会以为改了会生效。
+ */
+function syncSettingDependencies() {
+  const pairs = [
+    ['#setting-auto-refresh', '#setting-interval'],
+    ['#setting-notify-quota', '#setting-quota-threshold'],
+    ['#setting-auto-backup', '#setting-backup-interval'],
+  ];
+  for (const [toggleSel, dependentSel] of pairs) {
+    const toggle = $(toggleSel);
+    const dep = $(dependentSel);
+    if (!toggle || !dep) continue;
+    dep.disabled = !toggle.checked;
+    dep.title = toggle.checked ? '' : t('settings.dependentDisabled');
+  }
+}
+
 function refreshSettingsLabels() {
   $('#backup-dir').textContent = appSettings.autoBackupDir || t('common.notSet');
   $('#last-backup-time').textContent = lastBackupTs
@@ -703,6 +1039,7 @@ async function loadSettings() {
   $('#setting-backup-interval').value = String(appSettings.autoBackupIntervalHours);
   lastBackupTs = await unwrap(api.getLastBackup());
   refreshSettingsLabels();
+  syncSettingDependencies();
   setupAutoRefresh();
 }
 
@@ -953,8 +1290,43 @@ document.body.addEventListener('click', async (e) => {
     return;
   }
 
+  // Cookie 到期/临期标签：点击直接续登该账号（cookie 还没过期时算提前续登）
+  const cookieTagBtn = e.target.closest('.tag-relogin');
+  if (cookieTagBtn) {
+    const target = allAccounts.find((a) => a.id === cookieTagBtn.dataset.id);
+    const advance = !!(target && typeof target.cookieExpiredAt === 'number' && target.cookieExpiredAt > Date.now());
+    await startRelogin(cookieTagBtn.dataset.id, { advance });
+    return;
+  }
+
   const detailBtn = e.target.closest('.btn-detail');
   if (detailBtn) { await openDetailDialog(detailBtn.dataset.id); return; }
+
+  const openTraeBtn = e.target.closest('.btn-open-trae');
+  if (openTraeBtn) {
+    const card = openTraeBtn.closest('.trace-ring');
+    openTraeBtn.disabled = true;
+    openTraeBtn.textContent = t('accounts.opening');
+    traceLaunching = true;
+    setTraceState(card, 'running');
+    try {
+      await unwrap(api.openTrae());
+      showToast(t('accounts.openIdeOk'));
+      setTraceState(card, 'success');
+      traeRunning = true;
+      traeRunningChecked = true;
+      updateTraeRunningPoll();
+      setTimeout(() => { renderUI(); traceLaunching = false; }, 1200);
+    } catch (err) {
+      showToast(err.message, true);
+      setTraceState(card, 'fail');
+      traceLaunching = false;
+      setTimeout(() => setTraceState(card, null), 1600);
+      openTraeBtn.disabled = false;
+      openTraeBtn.textContent = t('accounts.openIde');
+    }
+    return;
+  }
 
   const switchBtn = e.target.closest('.btn-switch-account');
   if (switchBtn) {
@@ -1042,14 +1414,57 @@ function handleDisclaimerDecline() {
 
 $('#btn-refresh-usage').addEventListener('click', (e) => handleRefresh(e.target));
 $('#btn-refresh-overview').addEventListener('click', (e) => handleRefresh(e.target));
+$('#btn-switch-best').addEventListener('click', async (e) => {
+  const btn = e.target;
+  btn.disabled = true;
+  try {
+    await handleSwitchBest();
+  } catch (err) {
+    showToast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
 function initAccountsSwitchTip() {
   const tip = $('#accounts-switch-tip');
   if (!tip) return;
+  const body = $('#accounts-tip-body');
+  const head = $('#btn-toggle-switch-tip');
+  const chevron = tip.querySelector('.accounts-tip-chevron');
+
+  // 默认收起；展开状态记忆在 localStorage，下次启动保持用户选择
+  let open = false;
+  try { open = localStorage.getItem('traehop-switch-tip-open') === '1'; } catch { /* */ }
+
+  function apply() {
+    tip.classList.toggle('expanded', open);
+    tip.classList.toggle('collapsed', !open);
+    if (body) body.hidden = !open;
+    if (head) head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (chevron) chevron.textContent = open ? '▾' : '▸';
+  }
+
+  function toggle() {
+    open = !open;
+    try { localStorage.setItem('traehop-switch-tip-open', open ? '1' : '0'); } catch { /* */ }
+    apply();
+  }
+
+  head?.addEventListener('click', (e) => {
+    if (e.target.closest('#btn-dismiss-switch-tip')) return;
+    toggle();
+  });
+  head?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  });
+
   try {
     if (localStorage.getItem('traehop-switch-tip-dismissed') === '1') {
       tip.classList.add('hidden');
     }
   } catch { /* */ }
+
+  apply();
 }
 
 $('#btn-dismiss-switch-tip')?.addEventListener('click', () => {
@@ -1297,19 +1712,29 @@ $('#setting-language').addEventListener('change', async (e) => {
   refreshSettingsLabels();
   setDisclaimerMode(disclaimerRequired);
   setCleanRunning(cleanCleaning);
+  syncSettingDependencies();
   renderUI();
   loadUsageHistory();
 });
 
-$('#setting-auto-refresh').addEventListener('change', (e) => saveSettings({ autoRefreshEnabled: e.target.checked }));
+$('#setting-auto-refresh').addEventListener('change', async (e) => {
+  await saveSettings({ autoRefreshEnabled: e.target.checked });
+  syncSettingDependencies();
+});
 $('#setting-interval').addEventListener('change', (e) => saveSettings({ autoRefreshIntervalMinutes: Math.max(5, Number(e.target.value)) }));
-$('#setting-notify-quota').addEventListener('change', (e) => saveSettings({ notifyLowQuota: e.target.checked }));
+$('#setting-notify-quota').addEventListener('change', async (e) => {
+  await saveSettings({ notifyLowQuota: e.target.checked });
+  syncSettingDependencies();
+});
 $('#setting-notify-expiry').addEventListener('change', async (e) => {
   await saveSettings({ notifyTokenExpiry: e.target.checked });
   renderExpiryAlerts();
 });
 $('#setting-quota-threshold').addEventListener('change', (e) => saveSettings({ lowQuotaThreshold: Number(e.target.value) }));
-$('#setting-auto-backup').addEventListener('change', (e) => saveSettings({ autoBackupEnabled: e.target.checked }));
+$('#setting-auto-backup').addEventListener('change', async (e) => {
+  await saveSettings({ autoBackupEnabled: e.target.checked });
+  syncSettingDependencies();
+});
 $('#setting-backup-interval').addEventListener('change', (e) => saveSettings({ autoBackupIntervalHours: Number(e.target.value) }));
 
 $('#btn-pick-backup-dir').addEventListener('click', async () => {
@@ -1366,6 +1791,10 @@ window.addEventListener('traehop:localechange', () => {
     await ensureDisclaimerAccepted();
     await loadTraePath();
     await refreshAccounts();
+    // 从 Trae 切回本窗口时重新探测：用户关掉 Trae 后「打开 IDE」按钮应重新出现
+    window.addEventListener('focus', () => syncTraeRunning(true));
+    // 窗口失焦即停光条并回到初始；启动中除外（Trae 抢焦点会把动画误停）
+    window.addEventListener('blur', () => { if (!traceLaunching) clearTraceRing(); });
     const p = await unwrap(api.getTraePath());
     if (!p) {
       try {

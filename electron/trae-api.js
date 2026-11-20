@@ -1,6 +1,19 @@
-const API_BASE_SG = 'https://api-sg-central.trae.ai';
-const API_BASE_US = 'https://api-us-east.trae.ai';
-const API_BASE_UG = 'https://ug-normal.trae.ai';
+// Trae 国内版（Trae CN）为单区域部署，不存在 SG/US 分区。
+// 以下基址均取自官方 D:\Program Files\Trae CN\resources\app\product.json：
+//   bootConfig.iCube.normal / market.trae / iCubeAgent -> https://api.trae.com.cn
+//   bootConfig.ug.trae / account.trae                  -> https://api.trae.cn
+//   iCubeApp.nativeAppConfig.authDomain                -> https://www.trae.cn
+// 原国际版基址 api-sg-central / api-us-east / ug-normal 在国内版不存在，会导致 fetch failed。
+const API_BASE_SG = 'https://api.trae.com.cn';
+const API_BASE_US = 'https://api.trae.com.cn';
+const API_BASE_UG = 'https://api.trae.cn';
+const WEB_ORIGIN = 'https://www.trae.cn';
+// 国内版 cookie 换 Token 沿用国际版路径，实测确认（2026-10-21）：
+//   POST {api.trae.com.cn|api.trae.cn}/cloudide/api/v3/common/GetUserToken + Cookie 头 -> 200，新 JWT 有效期 8 小时
+//   /api/v2/GetUserToken 在国内版返回 404（那是 X-Cloudide-Token 头换 Token 的路径，cookie 方式不可用）
+const GET_USER_TOKEN_PATH = '/cloudide/api/v3/common/GetUserToken';
+// 国内版积分用量接口（bootConfig.ug.trae.normal 基址 + out/main.js _postApi(uo.ugApi,...)）
+const CN_ENT_USAGE_PATH = '/trae/api/v2/pay/ide_user_ent_usage';
 
 function parseJwtPayload(token) {
   const parts = token.trim().split('.');
@@ -147,8 +160,8 @@ async function getUserToken(cookies) {
   const headers = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/plain, */*',
-    Origin: 'https://www.trae.ai',
-    Referer: 'https://www.trae.ai/',
+    Origin: WEB_ORIGIN,
+    Referer: `${WEB_ORIGIN}/`,
     Cookie: cleaned,
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -160,14 +173,24 @@ async function getUserToken(cookies) {
     seen.add(base);
 
     try {
-      const res = await fetch(`${base}/cloudide/api/v3/common/GetUserToken`, {
+      const res = await fetch(`${base}${GET_USER_TOKEN_PATH}`, {
         method: 'POST',
         headers,
         body: '{}',
       });
 
       if (!res.ok) {
-        lastError = `GetUserToken 返回 ${res.status}`;
+        // 带上响应体里的业务错误码/信息（如 20113 Session 过期），否则 UI 只见裸状态码，
+        // 无法区分「会话被吊销需续登」与「网络/服务异常」
+        let detail = '';
+        try {
+          const errBody = await res.json();
+          const e = errBody?.ResponseMetadata?.Error;
+          if (e?.Code) detail = `（${e.Code} ${e.Message || ''}）`;
+        } catch {
+          /* 响应体非 JSON 时忽略 */
+        }
+        lastError = `GetUserToken 返回 ${res.status}${detail}`;
         continue;
       }
 
@@ -196,12 +219,28 @@ async function getUserToken(cookies) {
   throw new Error(lastError);
 }
 
+// 国内版登录 cookie 的寿命写在 sid_guard 里：sid_guard=<session>%7C<签发秒>%7C<有效期秒>%7C<GMT 串>
+// 实测样本：sid_guard=...%7C1792488722%7C5184000%7CSat%2C+19-Dec-2026... -> 签发+60 天到期
+function parseCookieExpiryMs(cookies) {
+  if (!cookies || typeof cookies !== 'string') return null;
+  const m = decodeURIComponent(cookies).match(/sid_guard=([^;]+)/);
+  if (!m) return null;
+  const parts = m[1].split('|');
+  const issuedSec = Number(parts[1]);
+  const lifetimeSec = Number(parts[2]);
+  if (Number.isFinite(issuedSec) && Number.isFinite(lifetimeSec) && issuedSec > 0 && lifetimeSec > 0) {
+    return (issuedSec + lifetimeSec) * 1000;
+  }
+  const gmt = Date.parse(parts[3] || '');
+  return Number.isNaN(gmt) ? null : gmt;
+}
+
 function buildHeaders(token) {
   return {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/plain, */*',
-    Origin: 'https://www.trae.ai',
-    Referer: 'https://www.trae.ai/',
+    Origin: WEB_ORIGIN,
+    Referer: `${WEB_ORIGIN}/`,
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     Authorization: `Cloud-IDE-JWT ${token}`,
@@ -215,7 +254,7 @@ function normalizeUserInfo(result) {
     name: result.ScreenName || result.screen_name || '',
     email: result.NonPlainTextEmail || result.non_plain_text_email || result.Email || result.email || '',
     avatarUrl: result.AvatarUrl || result.avatar_url || '',
-    region: result.Region || result.region || '',
+    region: result.Region || result.region || 'CN',
   };
 }
 
@@ -230,7 +269,7 @@ function mergeProfile(base, incoming) {
 }
 
 async function getUserInfoWithToken(token) {
-  const endpoints = [API_BASE_UG, API_BASE_SG, API_BASE_US];
+  const endpoints = [API_BASE_SG, API_BASE_UG];
   for (const base of endpoints) {
     try {
       const res = await fetch(`${base}/cloudide/api/v3/trae/GetUserInfo`, {
@@ -251,12 +290,12 @@ async function getUserInfoWithToken(token) {
 
 async function getUserInfoWithCookies(cookies) {
   if (!cookies || !cookies.trim()) return null;
-  const endpoints = [API_BASE_UG, API_BASE_SG, API_BASE_US];
+  const endpoints = [API_BASE_SG, API_BASE_UG];
   const headers = {
     'Content-Type': 'application/json',
     Accept: 'application/json, text/plain, */*',
-    Origin: 'https://www.trae.ai',
-    Referer: 'https://www.trae.ai/',
+    Origin: WEB_ORIGIN,
+    Referer: `${WEB_ORIGIN}/`,
     Cookie: cookies.trim(),
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -286,7 +325,7 @@ async function resolveUserProfile(token, extras = {}) {
     name: extras.name || extras.username || '',
     email: extras.email || '',
     avatarUrl: extras.avatarUrl || '',
-    region: extras.region || '',
+    region: extras.region || 'CN',
   };
 
   if (extras.cookies) {
@@ -309,15 +348,13 @@ async function resolveUserProfile(token, extras = {}) {
     name: profile.name,
     email: profile.email,
     avatarUrl: profile.avatarUrl,
-    region: profile.region || 'SG',
+    region: profile.region || 'CN',
     tokenExp: jwt.exp,
   };
 }
 
-function parseEntitlementsToSummary(data) {
-  const isDollarBilling = !!data.is_dollar_usage_billing;
-
-  const summary = {
+function createEmptySummary(isDollarBilling) {
+  return {
     isDollarBilling,
     planType: 'Free',
     resetTime: 0,
@@ -347,8 +384,54 @@ function parseEntitlementsToSummary(data) {
     autocompleteLimit: 0,
     autocompleteLeft: 0,
   };
+}
 
-  for (const pack of data.user_entitlement_pack_list || []) {
+function parseEntitlementsToSummary(data) {
+  const isDollarBilling = !!data.is_dollar_usage_billing;
+
+  const packs = data.user_entitlement_pack_list || [];
+
+  // 国内版（Trae CN）积分制字段：entitlement_base_info.quota.credits_limit（-1=无限）+ usage.credits_amount。
+  // 解析逻辑对照国内版官方 cnCreditsUsage.js（out/main.js 内 NGe 函数）：任一包为 -1 即视为整体无限剩余。
+  const isCredits = packs.some(
+    (p) => p?.entitlement_base_info?.quota && 'credits_limit' in p.entitlement_base_info.quota
+  );
+  if (isCredits) {
+    let hasAny = false;
+    let unlimited = false;
+    let limitSum = 0;
+    let usedSum = 0;
+    let remainSum = 0;
+    for (const p of packs) {
+      const limit = p?.entitlement_base_info?.quota?.credits_limit;
+      const used = p?.usage?.credits_amount ?? 0;
+      if (limit === -1) {
+        hasAny = true;
+        unlimited = true;
+      } else if (typeof limit === 'number' && limit > 0) {
+        hasAny = true;
+        limitSum += limit;
+        remainSum += Math.max(limit - used, 0);
+      }
+      if (typeof limit === 'number' && limit !== 0) usedSum += used;
+    }
+    if (hasAny) {
+      const summary = createEmptySummary(isDollarBilling);
+      summary.isCreditsBilling = data.is_credits_billing === true;
+      summary.unlimited = unlimited;
+      summary.planType = packs[0]?.display_desc || 'Free';
+      summary.resetTime = packs[0]?.entitlement_base_info?.end_time || 0;
+      summary.displayUsed = usedSum;
+      summary.displayLimit = unlimited ? Infinity : limitSum;
+      summary.displayLeft = unlimited ? Infinity : remainSum;
+      summary.exhausted = false;
+      return summary;
+    }
+  }
+
+  const summary = createEmptySummary(isDollarBilling);
+
+  for (const pack of packs) {
     const base = pack.entitlement_base_info || {};
     const usage = pack.usage || {};
     const quota = base.quota || {};
@@ -424,15 +507,16 @@ async function getUsageSummary(token) {
   }
 
   const headers = buildHeaders(token);
-  const endpoints = [API_BASE_SG, API_BASE_US];
+  const endpoints = [API_BASE_UG, API_BASE_SG];
   let lastError = '获取额度失败';
 
   for (const base of endpoints) {
     try {
-      const res = await fetch(`${base}/trae/api/v1/pay/user_current_entitlement_list`, {
+      // 国内版积分用量接口（product.json ugApi 基址 + out/main.js _postApi 实测路径）
+      const res = await fetch(`${base}${CN_ENT_USAGE_PATH}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ require_usage: true }),
+        body: JSON.stringify({ require_usage: true, req_source: 1 }),
       });
 
       if (!res.ok) {
@@ -441,6 +525,10 @@ async function getUsageSummary(token) {
       }
 
       const data = await res.json();
+      if (data.code !== undefined && data.code !== 0) {
+        lastError = `业务错误 code=${data.code}`;
+        continue;
+      }
       return parseEntitlementsToSummary(data);
     } catch (err) {
       lastError = err.message;
@@ -453,15 +541,15 @@ async function getUsageSummary(token) {
 async function validateToken(token, extras = {}) {
   const jwt = parseJwtPayload(token);
   const headers = buildHeaders(token);
-  const endpoints = [API_BASE_SG, API_BASE_US];
+  const endpoints = [API_BASE_UG, API_BASE_SG];
   let lastError = 'Token 验证失败';
 
   for (const base of endpoints) {
     try {
-      const res = await fetch(`${base}/trae/api/v1/pay/user_current_entitlement_list`, {
+      const res = await fetch(`${base}${CN_ENT_USAGE_PATH}`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ require_usage: true }),
+        body: JSON.stringify({ require_usage: true, req_source: 1 }),
       });
 
       if (!res.ok) {
@@ -470,11 +558,15 @@ async function validateToken(token, extras = {}) {
       }
 
       const data = await res.json();
+      if (data.code !== undefined && data.code !== 0) {
+        lastError = `业务错误 code=${data.code}`;
+        continue;
+      }
       const pack = data.user_entitlement_pack_list?.[0];
       const userId = pack?.entitlement_base_info?.user_id || jwt.userId;
       const profile = await resolveUserProfile(token, {
         ...extras,
-        region: pack?.entitlement_base_info?.region || extras.region,
+        region: pack?.entitlement_base_info?.region || extras.region || 'CN',
       });
 
       return {
@@ -504,4 +596,5 @@ module.exports = {
   parseEntitlementsToSummary,
   cleanCookies,
   resolveExpiredAt,
+  parseCookieExpiryMs,
 };

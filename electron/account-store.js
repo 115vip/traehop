@@ -13,9 +13,10 @@ const {
   parseJwtPayload,
   cleanCookies,
   resolveExpiredAt,
+  parseCookieExpiryMs,
 } = require('./trae-api');
 const { encryptPayload, decryptPayload, isEncryptedBackup } = require('./backup-crypto');
-const { ensureDataDir } = require('./data-path');
+const { ensureDataDir, getStableDataDir } = require('./data-path');
 const { DATA_STORE_NAME, BACKUP_FORMAT } = require('./app-brand');
 
 const storeCwd = ensureDataDir();
@@ -37,6 +38,12 @@ const DEFAULT_SETTINGS = {
   autoBackupDir: '',
 };
 
+// 默认备份目录放用户数据目录下的 backups/，不要落到程序安装目录：
+// Program Files 里的备份会在重装/卸载时一起消失，且部分环境写入需要提权。
+function defaultBackupDir() {
+  return path.join(getStableDataDir(), 'backups');
+}
+
 function getSettings() {
   const saved = store.get('settings', {});
   const interval = Math.max(5, Number(saved.autoRefreshIntervalMinutes) || 5);
@@ -52,7 +59,7 @@ function getSettings() {
     lowQuotaThreshold: Math.max(1, Number(saved.lowQuotaThreshold) || 10),
     autoBackupEnabled: !!saved.autoBackupEnabled,
     autoBackupIntervalHours: Math.max(1, Number(saved.autoBackupIntervalHours) || 24),
-    autoBackupDir: saved.autoBackupDir || '',
+    autoBackupDir: saved.autoBackupDir || defaultBackupDir(),
   };
 }
 
@@ -83,7 +90,9 @@ function saveUsageHistory(history) {
   store.set('usageHistory', history.slice(-MAX_USAGE_HISTORY));
 }
 
-function toBrief(account, traeUserId) {
+// deviceId 为可选第三参：设备标识是机器级的（切换账号不会变），
+// 列表场景应由调用方读一次后复用，避免 N 个账号同步读盘 N 次。
+function toBrief(account, traeUserId, deviceId) {
   return {
     id: account.id,
     name: account.name,
@@ -101,7 +110,42 @@ function toBrief(account, traeUserId) {
     tokenExpired: isAccountTokenExpired(account),
     tokenExpiringSoon: isAccountTokenExpiringSoon(account),
     hasCookies: !!(account.cookies && account.cookies.trim()),
+    cookieExpiredAt: account.cookies ? parseCookieExpiryMs(account.cookies) : null,
+    // 设备标识（只读展示）：让用户直接核对「切换账号后 x-device-id 是否变化」
+    deviceId: deviceId !== undefined ? deviceId : readDeviceIdSafe(),
   };
+}
+
+// 设备 ID 实际存放于 Trae 的 storage.json 键名 iCubeAuthInfo://icube-dc:<id>，
+// 这也是签到接口上报 x-device-id 的来源。这里只读不写。
+// 每张卡片 toBrief 都会走这里 → 账号数 N 就是 N 次 existsSync+readFileSync+JSON.parse。
+// 500ms 缓存把「一批 listAccounts」收敛为 1 次读盘；切换账号流程耗时远超 500ms，
+// 不会读到旧设备 ID（切号后首次 list 必然已过缓存期）。
+let deviceIdCache = { value: null, at: 0 };
+const DEVICE_ID_TTL_MS = 500;
+
+function readDeviceIdSafe() {
+  const now = Date.now();
+  if (now - deviceIdCache.at < DEVICE_ID_TTL_MS) return deviceIdCache.value;
+  let value = null;
+  try {
+    // 与 syncCurrentFromTrae 保持一致：按需 require，避免循环依赖
+    const { readDeviceId } = require('./trae-reader');
+    value = readDeviceId();
+  } catch {
+    value = null;
+  }
+  // 失败结果同样入缓存，避免磁盘异常时每账号重复读盘
+  deviceIdCache = { value, at: now };
+  return value;
+}
+
+// cookie 剩余不足 7 天视为即将过期，提示续登（cookie 失效后无法再自动换 Token）
+const COOKIE_EXPIRING_SOON_MS = 7 * 24 * 60 * 60 * 1000;
+
+function isCookieExpiringSoon(account) {
+  const expMs = account.cookies ? parseCookieExpiryMs(account.cookies) : null;
+  return typeof expMs === 'number' && expMs - Date.now() < COOKIE_EXPIRING_SOON_MS;
 }
 
 function applyTokenExpiryFields(account, token, expiredAt, { resetIfMissing = false } = {}) {
@@ -124,6 +168,8 @@ function applyTokenRefresh(account, result) {
   }
   account.token = result.token;
   applyTokenExpiryFields(account, result.token, result.expiredAt, { resetIfMissing: true });
+  // cookie 换新成功 = 会话恢复健康，清除吊销熔断标记
+  account.cookieRevokedAt = null;
   account.updatedAt = Date.now();
 }
 
@@ -134,8 +180,12 @@ async function enrichSessionFromCookies(account) {
     if (result.userId && account.userId && result.userId !== account.userId) return false;
     account.token = result.token || account.token;
     applyTokenExpiryFields(account, account.token, result.expiredAt, { resetIfMissing: true });
+    account.cookieRevokedAt = null;
     return true;
-  } catch {
+  } catch (err) {
+    // 吞错是「死区」类 bug 的温床：预刷新失败至少留一条可查的日志
+    if (isSessionRevokedError(err.message)) account.cookieRevokedAt = Date.now();
+    console.warn(`[enrich] ${account.name || account.email || account.id} 预刷新失败: ${err.message}`);
     return false;
   }
 }
@@ -282,6 +332,8 @@ async function updateAccountToken(id, token, extras = {}) {
   account.avatarUrl = info.avatarUrl || extras.avatarUrl || account.avatarUrl;
   account.region = info.region || account.region;
   applyTokenExpiryFields(account, trimmed, extras.tokenExpiredAt);
+  // 续登成功 = 新会话健康，清除吊销熔断标记
+  account.cookieRevokedAt = null;
   if (extras.cookies) account.cookies = cleanCookies(extras.cookies);
   await enrichSessionFromCookies(account);
   account.updatedAt = Date.now();
@@ -323,38 +375,47 @@ async function ensureValidToken(id) {
 async function refreshAllExpiredTokens() {
   const data = getStore();
   let refreshed = 0;
-  let failed = 0;
+  // 原用单一 failed 同时统计两种失败：一是「用 cookie 换 Token 失败」（cookie 多半已失效，必须重登），
+  // 二是「预刷新会话失败」（还没过期，只是没续上，属可容忍）。混在一起会让日志误报严重程度。
+  let refreshFailed = 0;
+  let syncFailed = 0;
 
   for (const account of data.accounts) {
     if (!account.token || !account.cookies || !isTokenExpired(account.token)) continue;
+    // 吊销熔断中：服务端已判死的 cookie 重试只会每轮产生 2 次无效 401 与 warn 噪音，等续登
+    if (isCookieRevoked(account)) continue;
     try {
       const result = await getUserToken(account.cookies);
       applyTokenRefresh(account, result);
       refreshed += 1;
-    } catch {
-      failed += 1;
+    } catch (err) {
+      if (isSessionRevokedError(err.message)) account.cookieRevokedAt = Date.now();
+      refreshFailed += 1;
     }
   }
 
   let synced = 0;
+  let revokedMarked = 0;
   for (const account of data.accounts) {
-    if (!account.cookies?.trim() || !isAccountTokenExpiringSoon(account)) continue;
+    if (!account.cookies?.trim() || isCookieRevoked(account) || !isAccountTokenExpiringSoon(account)) continue;
     try {
       await enrichSessionFromCookies(account);
       synced += 1;
     } catch {
-      failed += 1;
+      syncFailed += 1;
     }
   }
+  revokedMarked = data.accounts.filter((a) => isCookieRevoked(a)).length;
 
-  if (refreshed > 0 || synced > 0) saveStore(data);
-  return { refreshed, synced, failed };
+  if (refreshed > 0 || synced > 0 || revokedMarked > 0) saveStore(data);
+  return { refreshed, synced, refreshFailed, syncFailed, failed: refreshFailed + syncFailed };
 }
 
 async function listAccounts() {
   const { traeUserId } = await syncCurrentFromTrae();
   const data = getStore();
-  return data.accounts.map((a) => toBrief(a, traeUserId));
+  const deviceId = readDeviceIdSafe();
+  return data.accounts.map((a) => toBrief(a, traeUserId, deviceId));
 }
 
 function getAccount(id) {
@@ -432,6 +493,20 @@ function setTraePath(p) {
   store.set('traePath', p);
 }
 
+// 服务端吊销会话的特征：本地 JWT 未过期，但 cookie 换新被拒（实测返回 code 20113 "Session 过期"）。
+// 此时 isAccountTokenExpired 仍为 false，UI 的续登按钮/过期标签全部不出现——账号掉进无法自救的死区。
+function isSessionRevokedError(msg) {
+  return /20113|Session 过期|session expired/i.test(msg || '');
+}
+
+// 熔断：会话被服务端吊销后唯一解法是续登；标记后 6 小时内跳过自动刷新/预刷新重试。
+// 续登成功（applyTokenRefresh / enrichSessionFromCookies / updateAccountToken）自动清除标记自愈。
+const COOKIE_REVOKED_RETRY_MS = 6 * 60 * 60 * 1000;
+
+function isCookieRevoked(account) {
+  return !!account.cookieRevokedAt && Date.now() - account.cookieRevokedAt < COOKIE_REVOKED_RETRY_MS;
+}
+
 async function getAccountUsage(id) {
   await ensureValidToken(id);
   let account = getAccount(id);
@@ -443,9 +518,25 @@ async function getAccountUsage(id) {
   } catch (err) {
     const msg = err.message || '';
     if (account.cookies && (msg.includes('401') || msg.includes('过期'))) {
-      await refreshAccountToken(id);
-      account = getAccount(id);
-      summary = await getUsageSummary(account.token);
+      try {
+        await refreshAccountToken(id);
+        account = getAccount(id);
+        summary = await getUsageSummary(account.token);
+      } catch (refreshErr) {
+        if (isSessionRevokedError(msg) || isSessionRevokedError(refreshErr.message)) {
+          // 置 tokenExpiredAt 为过去 → isAccountTokenExpired 转为 true →
+          // 卡片出现「已过期」标签与「续登」按钮；续登成功后 applyTokenExpiryFields 用新 JWT 复位
+          const data = getStore();
+          const stored = data.accounts.find((a) => a.id === id);
+          if (stored) {
+            stored.tokenExpiredAt = Date.now() - 1;
+            stored.cookieRevokedAt = Date.now();
+            saveStore(data);
+          }
+          throw new Error('登录会话已被服务端吊销（Cookie 失效），请点击「续登」重新登录');
+        }
+        throw refreshErr;
+      }
     } else {
       throw err;
     }
@@ -458,20 +549,53 @@ async function getAccountUsage(id) {
 function recordUsageSnapshot(account, summary) {
   if (!summary) return;
   const history = getUsageHistory();
+
+  const used = summary.displayUsed ?? 0;
+  const limit = summary.displayLimit ?? 0;
+  const left = summary.displayLeft ?? 0;
+  const planType = summary.planType || '';
+  const isDollarBilling = !!summary.isDollarBilling;
+  const resetTime = summary.resetTime || 0;
+
+  // 每次「刷新用量」都会给所有账号各追加一条；用量没变化时这些记录内容完全相同，
+  // 200 条配额会被同一串重复值占满（实测：2 账号各 99/101 条里只有 5 条是真变化）。
+  // 因此内容未变时只续时间戳，不新增条目 —— 保留下来的才是真正发生了消费的记录。
+  const last = [...history].reverse().find((h) => h.accountId === account.id);
+  if (
+    last &&
+    last.used === used &&
+    last.limit === limit &&
+    last.left === left &&
+    last.planType === planType &&
+    last.isDollarBilling === isDollarBilling &&
+    // resetTime 必须参与比较：周期翻页是差分的基线边界，哪怕用量没变也要留一个点
+    (last.resetTime || 0) === resetTime
+  ) {
+    last.timestamp = Date.now();
+    saveUsageHistory(history);
+    return;
+  }
+
   history.push({
     accountId: account.id,
     email: account.email || account.name,
-    used: summary.displayUsed ?? 0,
-    limit: summary.displayLimit ?? 0,
-    left: summary.displayLeft ?? 0,
-    planType: summary.planType || '',
-    isDollarBilling: !!summary.isDollarBilling,
+    used,
+    limit,
+    left,
+    planType,
+    isDollarBilling,
+    // resetTime 用于判定跨计费周期：used 变小即新周期，不能直接算负增量
+    resetTime,
+    // 上一条的累计值留档，前端即使拿不到完整历史也能还原本次增量
+    prevUsed: last ? last.used : null,
     timestamp: Date.now(),
   });
   saveUsageHistory(history);
 }
 
-function getUsageHistoryForOverview(limit = 50) {
+// 概览页要按「相邻两条的差值」算每次消耗，切片会丢掉基线导致首条算不出增量，
+// 因此给足 MAX_USAGE_HISTORY（200 条，store 层已封顶）
+function getUsageHistoryForOverview(limit = MAX_USAGE_HISTORY) {
   return getUsageHistory().slice(-limit).reverse();
 }
 
@@ -680,6 +804,7 @@ module.exports = {
   getUsageHistoryForOverview,
   refreshAccountProfile,
   refreshAllProfiles,
+  isCookieExpiringSoon,
   exportAccountsData,
   serializeExport,
   parseImportFileContent,

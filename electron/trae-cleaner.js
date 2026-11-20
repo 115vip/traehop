@@ -91,7 +91,7 @@ async function killProcessesMac(log, cancelled) {
 }
 
 async function killProcessesWin(log, cancelled) {
-  const images = ['Trae.exe', 'trae-server.exe', 'Trae Helper.exe', 'Trae Helper (GPU).exe'];
+  const images = ['Trae CN.exe', 'trae-server.exe', 'Trae Helper.exe', 'Trae Helper (GPU).exe'];
   for (const img of images) {
     if (cancelled()) return;
     try {
@@ -188,7 +188,7 @@ async function cleanCredentialsMac(log, cancelled) {
 async function cleanCredentialsWin(log, cancelled) {
   log('清理 Windows 凭据管理器中的 Trae 条目...');
   const script = `
-    $targets = @('trae', 'com.trae.app', 'Trae')
+    $targets = @('trae', 'com.trae.app', 'Trae', 'Trae CN')
     cmdkey /list 2>$null | ForEach-Object {
       if ($_ -match 'Target:\\s*(.+)') {
         $t = $Matches[1].Trim()

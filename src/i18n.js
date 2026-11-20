@@ -37,20 +37,16 @@
       ['#page-overview .strip-stat.strip-ok .strip-label', 'overview.withQuota'],
       ['#page-overview .strip-stat.strip-warn .strip-label', 'overview.noQuota'],
       ['#page-overview .strip-stat.strip-accent .strip-label', 'overview.totalLeft'],
-      ['#page-overview .strip-stat.strip-usage .strip-label', 'overview.totalUsage'],
+      ['#page-overview .strip-stat.strip-state .strip-label', 'overview.sessionStatus'],
       ['#page-overview .usage-panel h3', 'overview.usageOverview'],
       ['#page-overview .ring-label', 'overview.used'],
       ['#page-overview .usage-detail div:nth-child(1) span', 'overview.usedLabel'],
       ['#page-overview .usage-detail div:nth-child(2) span', 'overview.limitLabel'],
       ['#page-overview .info-panel h3', 'overview.otherInfo'],
-      ['#page-overview .info-row:nth-child(1) span', 'overview.tokenExpired'],
-      ['#page-overview .info-row:nth-child(2) span', 'overview.expiringSoon'],
-      ['#page-overview .info-row:nth-child(3) span', 'overview.lastReset'],
-      ['#page-overview .info-row:nth-child(4) span', 'overview.lastRefresh'],
       ['#expiry-alerts h3', 'overview.needsAttention'],
       ['#page-overview .history-panel h3', 'overview.usageHistory'],
       ['#page-overview .history-header span:nth-child(1)', 'overview.historyEmail'],
-      ['#page-overview .history-header span:nth-child(2)', 'overview.historyLeft'],
+      ['#page-overview .history-header span:nth-child(2)', 'overview.historyDelta'],
       ['#page-overview .history-header span:nth-child(3)', 'overview.historyTime'],
       ['#page-accounts .page-header h1', 'accounts.title'],
       ['#page-accounts .page-desc', 'accounts.desc'],
@@ -126,6 +122,11 @@
 
     const themeBtn = root.querySelector('#btn-theme-toggle');
     if (themeBtn) themeBtn.title = t('theme.toggle');
+    // 主题标签由 applyTheme() 写入，切语言时不会重跑，这里补一次，否则中文「深色模式」会残留
+    const themeLabel = root.querySelector('#theme-toggle-label');
+    if (themeLabel) {
+      themeLabel.textContent = document.documentElement.dataset.theme === 'light' ? t('theme.lightMode') : t('theme.darkMode');
+    }
     const addBtn = root.querySelector('#btn-add');
     if (addBtn) {
       const svg = addBtn.querySelector('svg');
@@ -140,7 +141,7 @@
 
     const sort = root.querySelector('#account-sort');
     if (sort) {
-      const opts = ['accounts.sortDefault', 'accounts.sortQuotaDesc', 'accounts.sortQuotaAsc', 'accounts.sortName', 'accounts.sortExpiry'];
+      const opts = ['accounts.sortDefault', 'accounts.sortQuotaDesc', 'accounts.sortQuotaAsc', 'accounts.sortUsedDesc', 'accounts.sortName', 'accounts.sortExpiry'];
       [...sort.options].forEach((o, i) => { if (opts[i]) o.textContent = t(opts[i]); });
     }
 
@@ -193,8 +194,9 @@
       dismissTip.setAttribute('aria-label', t('common.close'));
     }
 
+    // 分组标题已经是「语言」，字段名再叫「语言」就重复了，这里写「界面语言」
     const langLabel = root.querySelector('label[for="setting-language"]');
-    if (langLabel) langLabel.textContent = t('settings.language');
+    if (langLabel) langLabel.textContent = t('settings.languageLabel');
 
     const langSelect = root.querySelector('#setting-language');
     if (langSelect) {

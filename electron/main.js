@@ -10,7 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const accountStore = require('./account-store');
 const { readCurrentTraeToken, getStoragePath } = require('./trae-reader');
-const { switchTraeAccount, scanTraePath } = require('./trae-switcher');
+const { switchTraeAccount, scanTraePath, openTrae, isTraeRunning } = require('./trae-switcher');
 const { getPlatformConfig } = require('./platform-config');
 const { startBrowserLogin, closeBrowserLogin } = require('./browser-login');
 const { TraeCleaner } = require('./trae-cleaner');
@@ -24,6 +24,7 @@ let activeCleaner = null;
 let trayApi = null;
 let reloginAccountId = null;
 let autoBackupTimer = null;
+let autoTokenRefreshTimer = null;
 const notifiedKeys = new Set();
 
 function notifyTraeAccountChanged() {
@@ -65,6 +66,23 @@ function setupStorageWatcher() {
   }
 }
 
+// 原实现只有 setInterval：首次触发要等满一个周期（默认 24 小时）。
+// TraeHop 是随用随开的工具，几乎不可能连续运行 24 小时 → 自动备份事实上从不发生
+// （实测 lastAutoBackupAt 从未写入）。这里启动时按「距上次备份是否已超过间隔」补跑一次，
+// 并把失败从静默忽略改为落日志，避免再出现「开了但没跑也没人知道」。
+function runAutoBackupSafely() {
+  try {
+    const result = accountStore.runAutoBackup();
+    if (result?.skipped) {
+      console.warn(`[auto-backup] 已跳过：${result.reason}`);
+      return;
+    }
+    console.log(`[auto-backup] 已备份 ${result.count} 个账号 → ${result.path}`);
+  } catch (err) {
+    console.warn(`[auto-backup] 备份失败：${err?.message || err}`);
+  }
+}
+
 function setupAutoBackupTimer() {
   if (autoBackupTimer) {
     clearInterval(autoBackupTimer);
@@ -74,13 +92,40 @@ function setupAutoBackupTimer() {
   const settings = accountStore.getSettings();
   if (!settings.autoBackupEnabled) return;
 
-  const ms = settings.autoBackupIntervalHours * 3600000;
-  autoBackupTimer = setInterval(() => {
-    try {
-      accountStore.runAutoBackup();
-    } catch {
-      /* ignore */
-    }
+  const ms = Math.max(1, Number(settings.autoBackupIntervalHours) || 24) * 3600000;
+  autoBackupTimer = setInterval(runAutoBackupSafely, ms);
+
+  const last = accountStore.getLastAutoBackupAt();
+  if (!last || Date.now() - last >= ms) runAutoBackupSafely();
+}
+
+// 国内版 JWT 实测有效期 8 小时；这里在后台定期用 cookie 换新 Token，避免窗口闲置时静默过期。
+// cookie 本身有约 60 天寿命，只要 cookie 还活着，Token 就能一直自动续。
+function setupAutoTokenRefreshTimer() {
+  if (autoTokenRefreshTimer) {
+    clearInterval(autoTokenRefreshTimer);
+    autoTokenRefreshTimer = null;
+  }
+
+  const settings = accountStore.getSettings();
+  if (!settings.autoRefreshEnabled) return;
+
+  const ms = Math.max(5, Number(settings.autoRefreshIntervalMinutes) || 5) * 60000;
+  autoTokenRefreshTimer = setInterval(() => {
+    accountStore
+      .refreshAllExpiredTokens()
+      .then((r) => {
+        if (r && (r.refreshed > 0 || r.synced > 0)) {
+          console.log(`[token-refresh] 续期 ${r.refreshed} 个，预刷新 ${r.synced} 个`);
+        }
+        if (r && r.refreshFailed > 0) {
+          console.warn(`[token-refresh] ${r.refreshFailed} 个账号续期失败（Token 已过期且 cookie 无法换新，需重登）`);
+        }
+        if (r && r.syncFailed > 0) {
+          console.warn(`[token-refresh] ${r.syncFailed} 个账号预刷新失败（尚未过期，可继续观察）`);
+        }
+      })
+      .catch(() => {});
   }, ms);
 }
 
@@ -162,6 +207,7 @@ app.whenReady().then(() => {
   }
   createWindow();
   setupAutoBackupTimer();
+  setupAutoTokenRefreshTimer();
 });
 
 app.on('window-all-closed', () => {
@@ -188,12 +234,24 @@ function wrap(handler) {
       const data = await handler(...args);
       return { ok: true, data };
     } catch (err) {
-      return { ok: false, error: err.message || String(err) };
+      // 原仅透传 message，丢失 code/name：例如 ERR_UNESCAPED_CHARACTERS 与 ECONNREFUSED
+      // 在界面上表现一致，无法区分。补上字段供日志与提示使用，不影响既有 error 字段。
+      return {
+        ok: false,
+        error: err.message || String(err),
+        code: err.code || null,
+        name: err.name || 'Error',
+      };
     }
   };
 }
 
 ipcMain.handle('accounts:list', wrap(() => accountStore.listAccounts()));
+ipcMain.handle('trae:open', wrap(() => {
+  openTrae();
+  return { ok: true };
+}));
+ipcMain.handle('trae:is-running', wrap(() => isTraeRunning()));
 ipcMain.handle('accounts:refresh-expired', wrap(() => accountStore.refreshAllExpiredTokens()));
 ipcMain.handle('accounts:refresh-token', wrap(({ id }) => accountStore.refreshAccountToken(id)));
 ipcMain.handle('accounts:sync-trae', wrap(() => accountStore.syncCurrentFromTrae()));
@@ -425,6 +483,7 @@ ipcMain.handle('settings:save-app', wrap((settings) => {
   const next = accountStore.saveSettings(settings || {});
   if (next.language) mainI18n.setLocale(next.language);
   setupAutoBackupTimer();
+  setupAutoTokenRefreshTimer();
   return next;
 }));
 

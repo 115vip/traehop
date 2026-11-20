@@ -63,7 +63,10 @@
             <h1>概览</h1>
             <p class="page-desc">账号与会话状态总览</p>
           </div>
-          <button type="button" id="btn-refresh-overview" class="btn btn-ghost">刷新用量</button>
+          <div class="page-header-actions">
+            <button type="button" id="btn-switch-best" class="btn btn-ghost" data-i18n="overview.switchBestBtn">切到余额最高</button>
+            <button type="button" id="btn-refresh-overview" class="btn btn-ghost">刷新用量</button>
+          </div>
         </header>
 
         <div id="overview-loading" class="page-loading">
@@ -85,6 +88,7 @@
             <div class="strip-stat">
               <span id="stat-total" class="strip-value">0</span>
               <span class="strip-label">账号总数</span>
+              <span id="stat-total-meta" class="strip-meta">—</span>
             </div>
             <div class="strip-stat strip-ok">
               <span id="stat-active" class="strip-value">0</span>
@@ -93,21 +97,18 @@
             </div>
             <div class="strip-stat strip-warn">
               <span id="stat-no-quota" class="strip-value">0</span>
-              <span class="strip-label">用量已满</span>
+              <span class="strip-label">已用完</span>
               <span id="stat-no-quota-ratio" class="strip-meta">—</span>
             </div>
             <div class="strip-stat strip-accent">
               <span id="stat-left" class="strip-value">—</span>
               <span class="strip-label">剩余合计</span>
-              <span id="stat-limit-unit" class="strip-meta">用量单位</span>
+              <span id="stat-limit-unit" class="strip-meta">—</span>
             </div>
-            <div class="strip-stat strip-usage">
-              <span id="stat-used-pct-inline" class="strip-value">0%</span>
-              <span class="strip-label">总使用率</span>
-              <span class="strip-meta"><span id="stat-used-inline">—</span> / <span id="stat-limit-inline">—</span></span>
-              <div class="strip-stat-progress" aria-hidden="true">
-                <div id="strip-progress-fill" class="strip-progress-fill"></div>
-              </div>
+            <div class="strip-stat strip-state">
+              <span id="stat-session" class="strip-value">0</span>
+              <span class="strip-label">会话状态</span>
+              <span id="stat-session-meta" class="strip-meta">—</span>
             </div>
           </div>
 
@@ -132,21 +133,13 @@
               </div>
 
               <div class="panel info-panel">
-                <h3>其他信息</h3>
+                <h3>时间信息</h3>
                 <div class="info-row">
-                  <span>Token 过期</span>
-                  <strong id="stat-expired">0</strong>
-                </div>
-                <div class="info-row">
-                  <span>即将过期</span>
-                  <strong id="stat-expiring">0</strong>
-                </div>
-                <div class="info-row">
-                  <span>最近重置</span>
+                  <span data-i18n="overview.lastReset">最近重置</span>
                   <strong id="stat-reset" class="info-sm">—</strong>
                 </div>
                 <div class="info-row">
-                  <span>上次刷新</span>
+                  <span data-i18n="overview.lastRefresh">上次刷新</span>
                   <strong id="last-refresh-time" class="info-sm">—</strong>
                 </div>
               </div>
@@ -161,12 +154,12 @@
               <h3>用量历史</h3>
               <div class="history-table">
                 <div class="history-header hidden">
-                  <span>账号</span>
-                  <span>剩余</span>
-                  <span>时间</span>
+                  <span data-i18n="overview.historyEmail">账号</span>
+                  <span data-i18n="overview.historyDelta">本次消耗</span>
+                  <span data-i18n="overview.historyTime">时间</span>
                 </div>
-                <div id="usage-history" class="usage-history">
-                  <p class="muted">刷新用量后会记录历史</p>
+                <div id="usage-history" class="usage-history is-empty">
+                  <p class="muted" data-i18n="overview.historyEmpty">刷新用量后会记录历史</p>
                 </div>
               </div>
             </div>
@@ -199,6 +192,7 @@
               <option value="default">默认排序</option>
               <option value="quota-desc">剩余用量 ↓</option>
               <option value="quota-asc">剩余用量 ↑</option>
+              <option value="used-desc">已用用量 ↓</option>
               <option value="name">名称</option>
               <option value="expiry">Token 过期时间</option>
             </select>
@@ -206,7 +200,7 @@
           <div class="filter-bar">
             <button type="button" class="filter-chip active" data-filter="all">全部</button>
             <button type="button" class="filter-chip" data-filter="has-quota">有剩余用量</button>
-            <button type="button" class="filter-chip" data-filter="no-quota">用量已满</button>
+            <button type="button" class="filter-chip" data-filter="no-quota">已用完</button>
             <button type="button" class="filter-chip" data-filter="expiring-soon">即将过期</button>
             <button type="button" class="filter-chip" data-filter="expired">已过期</button>
             <label class="select-all-row">
@@ -217,19 +211,22 @@
           </div>
         </div>
 
-        <div id="accounts-switch-tip" class="accounts-tip">
-          <div class="accounts-tip-body">
+        <div id="accounts-switch-tip" class="accounts-tip collapsed">
+          <div class="accounts-tip-head" id="btn-toggle-switch-tip" role="button" tabindex="0" aria-expanded="false" title="点击收起 / 展开">
+            <span class="accounts-tip-chevron" aria-hidden="true">▸</span>
             <p class="accounts-tip-title">切换说明</p>
+            <button type="button" id="btn-dismiss-switch-tip" class="accounts-tip-close" title="不再显示" aria-label="关闭说明">×</button>
+          </div>
+          <div class="accounts-tip-body" id="accounts-tip-body" hidden>
             <div class="accounts-tip-items">
               <span class="accounts-tip-item"><strong>切换</strong> 手动写入目标账号登录信息并重启 Trae，适合日常工作 / 个人账号切换</span>
               <span class="accounts-tip-item"><strong>重置环境后切换</strong>（高级）先清理本地缓存与设备标识再切换，仅在会话异常时使用，可能违反平台服务条款</span>
             </div>
           </div>
-          <button type="button" id="btn-dismiss-switch-tip" class="accounts-tip-close" title="不再显示" aria-label="关闭说明">×</button>
         </div>
 
         <div id="account-list" class="account-list">
-          <p class="empty">暂无账号</p>
+          <p class="empty" data-i18n="accounts.empty">暂无账号，点击左侧「添加账号」</p>
         </div>
       </section>
 
@@ -250,7 +247,7 @@
                 <span class="clean-card-title">可清理空间</span>
                 <span id="clean-platform" class="platform-tag"></span>
               </div>
-              <p id="clean-scan-size" class="clean-scan-size">扫描中…</p>
+              <p id="clean-scan-size" class="clean-scan-size" data-i18n="common.scanning">扫描中…</p>
               <ul id="clean-scan-items" class="clean-scan-items"></ul>
             </div>
 
@@ -305,7 +302,7 @@
           <h3>语言</h3>
           <p class="settings-desc">界面显示语言</p>
           <div class="setting-row">
-            <label for="setting-language">Language</label>
+            <label for="setting-language">界面语言</label>
             <select id="setting-language" class="select">
               <option value="zh">中文</option>
               <option value="en">English</option>
@@ -378,7 +375,7 @@
 
         <div class="settings-group">
           <h3>自动备份</h3>
-          <p class="settings-desc">定时导出账号备份到本地目录（明文 JSON）</p>
+          <p class="settings-desc">定时导出账号备份到本地目录（明文 JSON，建议不要放在程序安装目录，重装会一起丢失）</p>
           <label class="toggle-row">
             <span>启用自动备份</span>
             <input type="checkbox" id="setting-auto-backup" />
@@ -426,7 +423,7 @@
             <h3>浏览器授权登录</h3>
             <ol class="tips-steps compact">
               <li>点击「打开浏览器登录」</li>
-              <li>在弹出窗口登录 trae.ai</li>
+              <li>在弹出窗口登录 www.trae.cn</li>
               <li>成功后自动添加并关闭窗口</li>
             </ol>
           </div>
@@ -440,7 +437,7 @@
             <details class="tips-details">
               <summary>如何获取？</summary>
               <ol class="tips-steps">
-                <li>浏览器打开 trae.ai 并登录</li>
+                <li>浏览器打开 www.trae.cn 并登录</li>
                 <li>F12 → Network → 筛选 <code>GetUserToken</code></li>
                 <li>复制 Response 中的 Token 或整段 JSON</li>
               </ol>
@@ -480,7 +477,7 @@
         <button type="button" id="btn-export-close" class="dialog-close">×</button>
       </div>
       <div class="dialog-content">
-        <p id="export-count-hint" class="dialog-hint">将导出 0 个账号</p>
+        <p id="export-count-hint" class="dialog-hint"></p>
         <label class="toggle-row compact">
           <span>密码加密</span>
           <input type="checkbox" id="export-encrypt" />
@@ -522,7 +519,7 @@
       </div>
       <div class="dialog-footer">
         <button type="button" id="btn-import-cancel" class="btn">取消</button>
-        <button type="button" id="btn-import-confirm" class="btn btn-primary">选择文件并导入</button>
+        <button type="button" id="btn-import-confirm" class="btn btn-primary" data-i18n="importDialog.pickFile">选择文件并导入</button>
       </div>
     </div>
   </dialog>
@@ -578,7 +575,7 @@
       </div>
       <div class="dialog-footer">
         <button type="button" id="btn-disclaimer-decline" class="btn">不同意并退出</button>
-        <button type="button" id="btn-disclaimer-accept" class="btn btn-primary">我已阅读并同意</button>
+        <button type="button" id="btn-disclaimer-accept" class="btn btn-primary" data-i18n="disclaimer.accept">我已阅读并同意</button>
       </div>
     </div>
   </dialog>

@@ -20,7 +20,8 @@ async function collectSessionCookies(loginWindow) {
   if (!loginWindow || loginWindow.isDestroyed()) return '';
   const cookies = await loginWindow.webContents.session.cookies.get({});
   return cookies
-    .filter((c) => c.domain && (c.domain.includes('trae.ai') || c.domain.includes('trae.')))
+    // 原为 includes('trae.ai') || includes('trae.')：前者被后者完全包含，属死条件
+    .filter((c) => c.domain && c.domain.includes('trae.'))
     .map((c) => `${c.name}=${c.value}`)
     .join('; ');
 }
@@ -152,7 +153,7 @@ function startBrowserLogin({ parentWindow, onSuccess, onFailed, onCancelled }) {
       }
     });
 
-    loginWindow.loadURL('https://www.trae.ai');
+    loginWindow.loadURL('https://www.trae.cn');
   });
 }
 

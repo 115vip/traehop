@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('traeAccounts', {
   importAccountsContent: (opts) => ipcRenderer.invoke('accounts:import-content', opts || {}),
   switchAccount: (id, skipCheck) => ipcRenderer.invoke('accounts:switch', { id, skipCheck }),
   cleanAndSwitch: (id) => ipcRenderer.invoke('accounts:clean-and-switch', { id }),
+  openTrae: () => ipcRenderer.invoke('trae:open'),
+  isTraeRunning: () => ipcRenderer.invoke('trae:is-running'),
   getUsageHistory: () => ipcRenderer.invoke('accounts:get-usage-history'),
   checkAlerts: () => ipcRenderer.invoke('accounts:notify-check'),
   getAccountUsage: (id) => ipcRenderer.invoke('accounts:get-usage', { id }),

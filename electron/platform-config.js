@@ -65,17 +65,26 @@ function getWinConfig() {
   const home = os.homedir();
   const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
   const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
-  const appSupport = path.join(appData, 'Trae');
+  const appSupport = path.join(appData, 'Trae CN');
+
+  const programFiles = process.env.ProgramFiles || path.join('C:', 'Program Files');
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || `${programFiles} (x86)`;
+  const traeAppCandidates = [
+    path.join(localAppData, 'Programs', 'Trae CN', 'Trae CN.exe'),
+    path.join(programFiles, 'Trae CN', 'Trae CN.exe'),
+    path.join(programFilesX86, 'Trae CN', 'Trae CN.exe'),
+  ];
 
   return {
     platform: 'win32',
     label: 'Windows',
     appSupportBase: appSupport,
     machineIdPath: path.join(appSupport, 'machineid'),
-    defaultTraeApp: path.join(localAppData, 'Programs', 'Trae', 'Trae.exe'),
+    defaultTraeApp: traeAppCandidates[0],
+    traeAppCandidates,
     dataSubdirs: DATA_SUBDIRS,
     cachePaths: [
-      path.join(localAppData, 'Trae'),
+      path.join(localAppData, 'Trae CN'),
       path.join(localAppData, 'trae-updater'),
       path.join(localAppData, 'com.trae.app'),
     ],

@@ -6,17 +6,12 @@
 
 TraeHop（Trae 账号跃迁）帮助持有多个合法 Trae 账号的开发者与团队，在 macOS / Windows 上手动切换 IDE 登录会话，省去反复登录。
 
-[![GitHub stars](https://img.shields.io/github/stars/kivenZhou/traehop?style=flat-square&logo=github)](https://github.com/kivenZhou/traehop/stargazers)
-[![GitHub release](https://img.shields.io/github/v/release/kivenZhou/traehop?style=flat-square&logo=github)](https://github.com/kivenZhou/traehop/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey?style=flat-square)
-[![Website](https://img.shields.io/badge/website-www.fastx.ink-6366f1?style=flat-square)](https://www.fastx.ink)
 
 <p align="center">
   <img src="build/image.png" alt="TraeHop 应用截图" width="780" />
 </p>
 
-**[📥 下载 Releases](https://github.com/kivenZhou/traehop/releases)** · **[⭐ Star 本项目](https://github.com/kivenZhou/traehop)** · **[🌐 官网](https://www.fastx.ink)**
+
 
 ---
 
@@ -68,7 +63,7 @@ TraeHop 是一款 **Electron 桌面应用**，只做一件事：在你**本人�
 
 ### 📥 预构建安装包（推荐）
 
-从 [GitHub Releases](https://github.com/kivenZhou/traehop/releases) 下载：
+
 
 | 平台 | 文件 |
 |------|------|
@@ -76,29 +71,8 @@ TraeHop 是一款 **Electron 桌面应用**，只做一件事：在你**本人�
 | 🍎 macOS Intel | `TraeHop-*-mac-x64.dmg` |
 | 🪟 Windows x64 | `TraeHop-*-win-x64.exe` |
 
-请只从上述 Releases 或 [官网](https://www.fastx.ink) 下载，第三方重打包版本无法验证。
 
-### 🔨 从源码运行
 
-```bash
-git clone https://github.com/kivenZhou/traehop.git
-cd traehop
-npm install
-npm run icons   # 可选
-npm start
-```
-
-### 📦 构建发布包（维护者）
-
-```bash
-npm run dist:mac-arm64   # macOS Apple Silicon
-npm run dist:mac-x64     # macOS Intel
-npm run dist:win         # Windows x64
-npm run dist:all         # 以上三个依次构建 → release/
-npm run publish:release  # 上传 GitHub Releases（需 gh CLI）
-```
-
----
 
 ## 快速上手
 
@@ -160,17 +134,7 @@ npm run publish:release  # 上传 GitHub Releases（需 gh CLI）
 | 🐧 | 支持 Linux 吗？ | 不支持。Trae IDE 官方仅支持 Windows 和 macOS。 |
 | ❓ | 和其他工具有何不同？ | TraeHop 定位是合规的本地会话管理：开源可审计、纯本地、仅手动切换、双平台、支持浏览器登录与加密备份。详见上文对比表。 |
 
----
 
-## 官方渠道
-
-| | 渠道 | 链接 |
-|---|------|------|
-| 📦 | 应用与安装包 | [github.com/kivenZhou/traehop](https://github.com/kivenZhou/traehop) |
-| 🌐 | 官网 | [www.fastx.ink](https://www.fastx.ink) |
-| 💻 | 官网源码 | [github.com/kivenZhou/fastx](https://github.com/kivenZhou/fastx) |
-
----
 
 ## 开发
 
@@ -188,10 +152,5 @@ traehop/
 npm run icons   # 修改 build/icon.svg 后重新生成图标
 ```
 
-问题反馈：[Issues](https://github.com/kivenZhou/traehop/issues)
 
----
 
-## License
-
-[MIT](LICENSE) — 附加限制：不得将本软件用于规避 Trae 平台计费、额度限制或用户协议。
